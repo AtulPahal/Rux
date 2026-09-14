@@ -1,0 +1,26 @@
+[package]
+name = "rux-cli"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rux"
+path = "src/main.rs"
+
+[[bin]]
+name = "inject"
+path = "src/bin/inject.rs"
+
+[[bin]]
+name = "injectarm"
+path = "src/bin/injectarm.rs"
+
+[dependencies]
+rux-core.workspace = true
+rux-proc.workspace = true
+rux-vm.workspace = true
+rux-inject.workspace = true
+clap.workspace = true
+libc.workspace = true

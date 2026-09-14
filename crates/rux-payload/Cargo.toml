@@ -1,0 +1,17 @@
+[package]
+name = "rux-payload"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "rux_payload"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rux-core.workspace = true
+rux-vm.workspace = true
+parking_lot.workspace = true
+libc.workspace = true
+thiserror.workspace = true

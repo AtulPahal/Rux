@@ -1,0 +1,17 @@
+[package]
+name = "rux-ffi"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "machinject"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+rux-core.workspace = true
+rux-proc.workspace = true
+rux-vm.workspace = true
+rux-inject.workspace = true
+libc.workspace = true

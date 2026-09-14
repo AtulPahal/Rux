@@ -1,0 +1,14 @@
+[package]
+name = "rux-inject"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rux-core.workspace = true
+rux-proc.workspace = true
+rux-vm.workspace = true
+libc.workspace = true
+mach2.workspace = true
+thiserror.workspace = true

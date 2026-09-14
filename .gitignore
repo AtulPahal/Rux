@@ -1,0 +1,13 @@
+/target/
+*.o
+*.dylib
+*.a
+/rux
+/inject
+/injectarm
+/main
+/dylibtest.dylib
+.DS_Store
+/app/build/
+/app/Resources/AppIcon.iconset/
+/Rux.app/
