@@ -4,7 +4,7 @@ A production-grade, memory-safe Darwin Mach-O dynamic library injection framewor
 
 ---
 
-## 🏗️ Architecture & Library Workspace
+## Architecture & Library Workspace
 
 The codebase is organized as a modular Rust workspace separating concerns into reusable, memory-safe libraries and CLI tools:
 
@@ -82,7 +82,7 @@ Fully replaces the legacy C++ client payload with a memory-safe, modular Rust dy
 
 ---
 
-## 🚀 Building & Testing
+##  Building & Testing
 
 ### Prerequisites
 - macOS (Apple Silicon or Intel)
@@ -107,7 +107,7 @@ make test
 
 ---
 
-## 🍏 Native macOS App (`Rux.app`)
+##  Native macOS App (`Rux.app`)
 
 Rux includes a fully native macOS GUI application (`Rux.app`) designed for macOS Apple Silicon and Intel:
 
@@ -115,7 +115,7 @@ Rux includes a fully native macOS GUI application (`Rux.app`) designed for macOS
 - **🔍 Process Scanner Tab**: High-speed real-time process scanner using Darwin `libproc` with live search, architecture filtering (`ARM64` / `x86_64`), and one-click process targeting.
 - **💻 Script Console & IPC Tab**: Real-time Luau script executor and TCP IPC client connecting to the injected payload on port `5553`. Includes script presets, syntax fonts, and payload ping testing.
 - **🩺 Diagnostics Tab**: Interactive runner for the Darwin system diagnostics suite verifying host architecture, process inspection, Mach VM allocation, and shared cache symbol resolution.
-- **📜 Activity Logs Tab**: Live log streaming with timestamped entries, level filtering, and clipboard export.
+- ** Activity Logs Tab**: Live log streaming with timestamped entries, level filtering, and clipboard export.
 
 ### Launching Rux.app
 ```bash
@@ -124,7 +124,7 @@ open Rux.app
 
 ---
 
-## 💻 CLI Usage
+##  CLI Usage
 
 ### Inject into a Process by Name
 ```bash
@@ -160,7 +160,7 @@ sudo ./injectarm ./exploit.dylib
 
 ---
 
-## 🔒 Security & Permissions Notice
+##  Security & Permissions Notice
 On macOS, accessing another process's Mach task port via `task_for_pid()` requires root privileges. Run injection commands with `sudo`:
 
 ```bash
