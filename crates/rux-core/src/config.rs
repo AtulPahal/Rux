@@ -68,7 +68,7 @@ pub const DISPATCHER_POLL_INTERVAL_MS: u64 = 10;
 pub const IPC_MSG_EXECUTE: u8 = 0;
 pub const IPC_MSG_SETTING: u8 = 1;
 pub const IPC_MSG_PING: u8 = 2;
-
+pub const IPC_MSG_TELEMETRY: u8 = 3;
 /// Single-byte acknowledgement sent in reply to `IPC_MSG_PING`.
 pub const IPC_PONG_BYTE: u8 = 0x10;
 

@@ -5,17 +5,17 @@
     <key>CFBundleDevelopmentRegion</key>
     <string>en</string>
     <key>CFBundleExecutable</key>
-    <string>Rux</string>
+    <string>Tux</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
-    <string>com.nexus42.rux</string>
+    <string>com.nexus42.tux</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>Rux</string>
+    <string>Tux</string>
     <key>CFBundleDisplayName</key>
-    <string>Rux</string>
+    <string>Tux</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -27,7 +27,7 @@
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSHumanReadableCopyright</key>
-    <string>Copyright © 2026 Nexus42 &amp; Rux Contributors. All rights reserved.</string>
+    <string>Copyright © 2026 Nexus42 &amp; Tux Contributors. All rights reserved.</string>
     <key>NSSupportsAutomaticGraphicsSwitching</key>
     <true/>
     <key>NSPrincipalClass</key>

@@ -43,7 +43,6 @@ cp "${SCRIPT_DIR}/Info.plist" "${APP_BUNDLE}/Contents/Info.plist"
 # Copy Main Executable
 cp "${BUILD_DIR}/Rux" "${APP_BUNDLE}/Contents/MacOS/Rux"
 chmod +x "${APP_BUNDLE}/Contents/MacOS/Rux"
-
 # Copy Bundled CLI Tools into Contents/MacOS and Contents/Helpers
 cp "${ROOT_DIR}/target/release/rux" "${APP_BUNDLE}/Contents/MacOS/rux-cli"
 cp "${ROOT_DIR}/target/release/rux" "${APP_BUNDLE}/Contents/Helpers/rux"
@@ -66,7 +65,6 @@ cp "${ROOT_DIR}/target/release/rux" "${APP_BUNDLE}/Contents/Resources/rux"
 # 5. Ad-hoc codesign the bundle
 echo "[5/5] Codesigning bundle with ad-hoc signature..."
 codesign --force --deep --sign - "${APP_BUNDLE}"
-
 echo ""
 echo "=========================================================="
 echo "  [SUCCESS] Rux.app successfully created at:"

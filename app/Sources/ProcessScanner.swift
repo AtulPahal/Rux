@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import Darwin
 import Combine
 
@@ -50,6 +51,15 @@ public final class ProcessScanner: ObservableObject {
         }
     }
     
+    public func refreshAsync() async {
+        isScanning = true
+        let scanned = await Task.detached(priority: .userInitiated) {
+            Self.enumerateProcesses()
+        }.value
+        self.processes = scanned
+        self.isScanning = false
+    }
+    
     private nonisolated static func enumerateProcesses() -> [ProcessItem] {
         let pidsBytes = proc_listpids(UInt32(PROC_ALL_PIDS), 0, nil, 0)
         guard pidsBytes > 0 else { return [] }
@@ -69,14 +79,20 @@ public final class ProcessScanner: ObservableObject {
             let pid = pids[i]
             guard pid > 0 else { continue }
             
-            // 1. Resolve executable path
+            // 1. Resolve executable path with clean buffer
             pathBuffer.withUnsafeMutableBufferPointer { ptr in
-                _ = proc_pidpath(pid, ptr.baseAddress, UInt32(ptr.count))
+                ptr.initialize(repeating: 0)
             }
-            let rawPath = String(cString: pathBuffer)
-            let path: String? = rawPath.isEmpty ? nil : rawPath
+            let pathRet = proc_pidpath(pid, &pathBuffer, UInt32(pathBuffer.count))
+            let path: String?
+            if pathRet > 0 {
+                let rawPath = String(cString: pathBuffer).trimmingCharacters(in: .whitespacesAndNewlines)
+                path = rawPath.isEmpty ? nil : rawPath
+            } else {
+                path = nil
+            }
             
-            // 2. Resolve process name
+            // 2. Resolve process name safely
             var name: String = ""
             if let path = path, !path.isEmpty {
                 name = (path as NSString).lastPathComponent
@@ -87,10 +103,10 @@ public final class ProcessScanner: ObservableObject {
                 let size = Int32(MemoryLayout<proc_bsdinfo>.size)
                 let res = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bsdInfo, size)
                 if res == size {
-                    let bsdName = withUnsafePointer(to: &bsdInfo.pbi_name) { ptr in
-                        ptr.withMemoryRebound(to: CChar.self, capacity: Int(MAXCOMLEN)) { cStr in
-                            String(cString: cStr)
-                        }
+                    let bsdName = withUnsafeBytes(of: &bsdInfo.pbi_name) { rawPtr -> String in
+                        let bytes = rawPtr.prefix(Int(MAXCOMLEN))
+                        let nullIdx = bytes.firstIndex(of: 0) ?? bytes.endIndex
+                        return String(decoding: bytes[..<nullIdx], as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
                     }
                     if !bsdName.isEmpty {
                         name = bsdName
@@ -102,10 +118,33 @@ public final class ProcessScanner: ObservableObject {
                 continue
             }
             
-            // 3. Query CPU architecture
+            // 3. Query CPU architecture with cached MIB
             let arch = queryCpuArch(pid: pid)
             
-            results.append(ProcessItem(pid: pid, name: name, path: path, arch: arch))
+            // 4. Check Running Application and Code Sign security flags
+            var bundleId: String? = nil
+            if let app = NSRunningApplication(processIdentifier: pid) {
+                bundleId = app.bundleIdentifier
+                if let localized = app.localizedName, !localized.isEmpty {
+                    name = localized
+                }
+            }
+            
+            let sec = ProcessInspection.fetchSecurity(pid: pid)
+            let isHardened = sec?.isHardenedRuntime ?? false
+            let reqLV = sec?.requiresLibraryValidation ?? false
+            let getTask = sec?.hasGetTaskAllow ?? false
+            
+            results.append(ProcessItem(
+                pid: pid,
+                name: name,
+                path: path,
+                arch: arch,
+                bundleIdentifier: bundleId,
+                isHardenedRuntime: isHardened,
+                requiresLibraryValidation: reqLV,
+                hasGetTaskAllow: getTask
+            ))
         }
         
         // Sort alphabetically by name, then by PID
@@ -118,15 +157,22 @@ public final class ProcessScanner: ObservableObject {
         }
     }
     
-    private nonisolated static func queryCpuArch(pid: pid_t) -> CpuArch {
+    private nonisolated static let cachedMibInfo: (mib: [Int32], len: Int)? = {
         var mib = [Int32](repeating: 0, count: 12)
         var mibLen: size_t = 12
-        var cputype: cpu_type_t = 0
-        var size = MemoryLayout<cpu_type_t>.size
-        
-        if sysctlnametomib("sysctl.proc_cputype", &mib, &mibLen) == 0 && mibLen < 12 {
-            mib[Int(mibLen)] = pid
-            let queryLen = u_int(mibLen + 1)
+        if sysctlnametomib("sysctl.proc_cputype", &mib, &mibLen) == 0 && mibLen < 11 {
+            return (mib, Int(mibLen))
+        }
+        return nil
+    }()
+    
+    private nonisolated static func queryCpuArch(pid: pid_t) -> CpuArch {
+        if let info = cachedMibInfo {
+            var mib = info.mib
+            mib[info.len] = pid
+            var cputype: cpu_type_t = 0
+            var size = MemoryLayout<cpu_type_t>.size
+            let queryLen = u_int(info.len + 1)
             if sysctl(&mib, queryLen, &cputype, &size, nil, 0) == 0 {
                 // Mach CPU_TYPE_ARM64 = 0x0100000c, CPU_TYPE_X86_64 = 0x01000007
                 if cputype == 0x0100000c {
@@ -136,13 +182,6 @@ public final class ProcessScanner: ObservableObject {
                 }
             }
         }
-        
-        #if arch(arm64)
-        return .arm64
-        #elseif arch(x86_64)
-        return .x86_64
-        #else
         return .unknown
-        #endif
     }
 }

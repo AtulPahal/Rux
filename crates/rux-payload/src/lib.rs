@@ -10,10 +10,10 @@ pub mod fingerprint;
 pub mod hook;
 pub mod http;
 pub mod ipc;
+pub mod luau;
 pub mod scripts;
 pub mod settings;
 pub mod whitelist;
-
 pub use crypto::*;
 pub use drawing::{DrawingObject, DrawingRegistry};
 pub use fingerprint::{fetch_fingerprint, parsed_fingerprint};
@@ -21,9 +21,9 @@ pub use hook::{write_hook, InlineHook};
 pub use http::{execute_request, receive_string, HttpRequest, HttpResponse};
 pub use ipc::{IpcServer, DEFAULT_PORT_START};
 pub use scripts::{INIT_SCRIPT, RPC_SCRIPT};
+pub use luau::{LuaStateLifecycle, LuaStateManager, LUA_STATE_MANAGER};
 pub use settings::{get_boolean, get_number, get_string, handle_setting, SettingsStore};
 pub use whitelist::{verify_whitelist, WhitelistStatus};
-
 use parking_lot::Mutex;
 use std::ffi::c_char;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
@@ -100,7 +100,9 @@ impl PayloadEngine {
                         "[Rux Dispatcher] Executing queued script ({} bytes)",
                         script.len()
                     );
-                    // Dispatched to Luau executor thread
+                    if let Err(e) = LuaStateManager::global().execute(&script) {
+                        eprintln!("[Rux Dispatcher] Script execution error: {}", e);
+                    }
                 }
                 thread::sleep(Duration::from_millis(
                     rux_core::config::DISPATCHER_POLL_INTERVAL_MS,

@@ -39,7 +39,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         appMenu.addItem(withTitle: "Show All", action: #selector(NSApplication.unhideAllApplications(_:)), keyEquivalent: "")
         appMenu.addItem(NSMenuItem.separator())
         appMenu.addItem(withTitle: "Quit Rux", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        
         // 2. Edit Menu (Standard text editing shortcuts)
         let editMenuItem = NSMenuItem()
         mainMenu.addItem(editMenuItem)
@@ -56,6 +55,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
         editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         
+        // 3. View Menu (Navigation shortcuts)
+        let viewMenuItem = NSMenuItem()
+        mainMenu.addItem(viewMenuItem)
+        let viewMenu = NSMenu(title: "View")
+        viewMenuItem.submenu = viewMenu
+        
+        let item1 = NSMenuItem(title: "Injector", action: #selector(handleSelectTab1), keyEquivalent: "1")
+        let item2 = NSMenuItem(title: "Processes", action: #selector(handleSelectTab2), keyEquivalent: "2")
+        let item3 = NSMenuItem(title: "Script Console", action: #selector(handleSelectTab3), keyEquivalent: "3")
+        let item4 = NSMenuItem(title: "Diagnostics", action: #selector(handleSelectTab4), keyEquivalent: "4")
+        let item5 = NSMenuItem(title: "Activity Logs", action: #selector(handleSelectTab5), keyEquivalent: "5")
+        viewMenu.addItem(item1)
+        viewMenu.addItem(item2)
+        viewMenu.addItem(item3)
+        viewMenu.addItem(item4)
+        viewMenu.addItem(item5)
         // 3. Window Menu
         let windowMenuItem = NSMenuItem()
         mainMenu.addItem(windowMenuItem)
@@ -76,11 +91,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 NSApplication.AboutPanelOptionKey.applicationName: "Rux",
                 NSApplication.AboutPanelOptionKey.version: "0.2.0",
                 NSApplication.AboutPanelOptionKey.credits: NSAttributedString(
-                    string: "Production-grade Darwin Mach-O Dynamic Library Injection Toolchain for macOS.\nSupports Apple Silicon (ARM64) and Intel (x86_64)."
+                    string: "Rux — Production-grade Darwin Mach-O Dynamic Library Injection Toolchain for macOS.\nSupports Apple Silicon (ARM64) and Intel (x86_64)."
                 )
             ]
         )
     }
+    
+    @objc private func handleSelectTab1() { mainWindowController?.selectTab(index: 0) }
+    @objc private func handleSelectTab2() { mainWindowController?.selectTab(index: 1) }
+    @objc private func handleSelectTab3() { mainWindowController?.selectTab(index: 2) }
+    @objc private func handleSelectTab4() { mainWindowController?.selectTab(index: 3) }
+    @objc private func handleSelectTab5() { mainWindowController?.selectTab(index: 4) }
 }
 
 // Application Entry Point

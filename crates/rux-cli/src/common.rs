@@ -260,6 +260,12 @@ pub fn execute_injection(opts: CliOptions) -> i32 {
         Err(err) => {
             eprintln!("\n[-] Injection Failed: {}", err);
             match &err {
+                rux_core::InjectError::ProcessNotFound(name) => {
+                    eprintln!("\n[!] No running process matching '{}' was found.", name);
+                    eprintln!("    Ensure the target application is launched before injecting.");
+                    eprintln!("    Use 'rux scan -n {}' to search for matching processes.", name);
+                    eprintln!("    Or specify the exact PID with -p <PID>.");
+                }
                 rux_core::InjectError::TaskForPidFailed { is_root: false, .. } => {
                     eprintln!("\n[!] Root privileges are required to attach to other processes.");
                     eprintln!("    Please re-run your command with sudo:");

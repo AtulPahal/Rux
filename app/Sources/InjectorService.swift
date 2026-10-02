@@ -46,7 +46,7 @@ public final class InjectorService: ObservableObject {
         for p in candidatePaths {
             let absPath = (p as NSString).expandingTildeInPath
             if fileManager.isExecutableFile(atPath: absPath) {
-                return absPath
+                return URL(fileURLWithPath: absPath).standardized.path
             }
         }
         
@@ -85,7 +85,7 @@ public final class InjectorService: ObservableObject {
         for p in devPaths {
             let absPath = (p as NSString).expandingTildeInPath
             if fileManager.fileExists(atPath: absPath) {
-                return absPath
+                return URL(fileURLWithPath: absPath).standardized.path
             }
         }
         
@@ -110,7 +110,7 @@ public final class InjectorService: ObservableObject {
         }
         
         // Resolve dynamic library path
-        var dylibPath = config.targetDylibPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        var dylibPath = (config.targetDylibPath as NSString).expandingTildeInPath.trimmingCharacters(in: .whitespacesAndNewlines)
         if dylibPath.isEmpty {
             if let defaultDylib = resolveDefaultDylib() {
                 dylibPath = defaultDylib
@@ -123,6 +123,8 @@ public final class InjectorService: ObservableObject {
                 isInjecting = false
                 return
             }
+        } else {
+            dylibPath = URL(fileURLWithPath: dylibPath).standardized.path
         }
         
         guard FileManager.default.fileExists(atPath: dylibPath) else {
@@ -136,15 +138,18 @@ public final class InjectorService: ObservableObject {
         
         // Build CLI argument list
         var args: [String] = ["inject", dylibPath]
+        var resolvedPid: Int32? = nil
         
         if let proc = config.targetProcess {
             args.append("-p")
             args.append("\(proc.pid)")
+            resolvedPid = proc.pid
             LogStore.shared.log(.info, "Targeting process: \(proc.name) (PID: \(proc.pid), Arch: \(proc.arch.rawValue))")
         } else if !config.targetPidText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             let pidStr = config.targetPidText.trimmingCharacters(in: .whitespacesAndNewlines)
             args.append("-p")
             args.append(pidStr)
+            resolvedPid = Int32(pidStr)
             LogStore.shared.log(.info, "Targeting specified PID: \(pidStr)")
         } else if !config.targetNameText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             let nameStr = config.targetNameText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -158,6 +163,22 @@ public final class InjectorService: ObservableObject {
             lastSuccess = false
             isInjecting = false
             return
+        }
+        
+        // Pre-flight: check Hardened Runtime + SIP for PID targets
+        if let pid = resolvedPid {
+            let sec = await Task.detached(priority: .userInitiated) {
+                ProcessInspection.fetchSecurity(pid: pid)
+            }.value
+            if let sec = sec, sec.isHardenedRuntime && !sec.hasGetTaskAllow {
+                let sipOk = await Task.detached(priority: .userInitiated) {
+                    ProcessInspection.isSipDebuggingAllowed()
+                }.value
+                if !sipOk {
+                    LogStore.shared.log(.warning, "Pre-flight: Target PID \(pid) has Hardened Runtime (flags=0x\(String(sec.csFlags, radix: 16))) without get-task-allow. SIP debugging restrictions are enabled — task_for_pid() will be denied by the kernel even with root.")
+                    LogStore.shared.log(.warning, "To inject Hardened Runtime targets: reboot into Recovery OS → run 'csrutil enable --without debug' → reboot → retry with sudo.")
+                }
+            }
         }
         
         args.append("-m")
@@ -184,12 +205,14 @@ public final class InjectorService: ObservableObject {
         let (exitCode, stdout, stderr) = taskResult
         let combinedOutput = [stdout, stderr].filter { !$0.isEmpty }.joined(separator: "\n")
         
-        for line in combinedOutput.components(separatedBy: "\n") {
+        // Split on \n, \r\n, and bare \r (AppleScript returns \r-separated lines)
+        let outputLines = combinedOutput.components(separatedBy: .newlines)
+        for line in outputLines {
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { continue }
-            if trimmed.contains("Injection confirmed") || trimmed.contains("successfully injected") {
+            if trimmed.contains("[+]") || trimmed.contains("Injection Succeeded") || trimmed.contains("Injection confirmed") || trimmed.contains("successfully injected") {
                 LogStore.shared.log(.success, trimmed)
-            } else if trimmed.contains("[-] Injection Failed") || trimmed.contains("Error:") {
+            } else if trimmed.contains("[-]") || trimmed.contains("Injection Failed") || trimmed.contains("Error:") {
                 LogStore.shared.log(.error, trimmed)
             } else if trimmed.contains("[!]") {
                 LogStore.shared.log(.warning, trimmed)
@@ -197,7 +220,6 @@ public final class InjectorService: ObservableObject {
                 LogStore.shared.log(.info, trimmed)
             }
         }
-        
         if exitCode == 0 {
             let successMsg = "Injection successfully completed! Exit code 0."
             LogStore.shared.log(.success, successMsg)
@@ -219,10 +241,11 @@ public final class InjectorService: ObservableObject {
     ) -> (exitCode: Int32, stdout: String, stderr: String) {
         if useAdmin {
             // Build escaped shell command for AppleScript
+            let escapedExec = "'" + executable.replacingOccurrences(of: "'", with: "'\\''") + "'"
             let escapedArgs = arguments.map { arg in
                 "'" + arg.replacingOccurrences(of: "'", with: "'\\''") + "'"
             }.joined(separator: " ")
-            let fullCommand = "'\(executable)' \(escapedArgs) 2>&1"
+            let fullCommand = "\(escapedExec) \(escapedArgs) 2>&1"
             
             let sanitized = fullCommand
                 .replacingOccurrences(of: "\\", with: "\\\\")
@@ -258,10 +281,25 @@ public final class InjectorService: ObservableObject {
             
             do {
                 try process.run()
-                process.waitUntilExit()
                 
-                let outData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-                let errData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+                var outData = Data()
+                var errData = Data()
+                let group = DispatchGroup()
+                
+                group.enter()
+                DispatchQueue.global(qos: .userInitiated).async {
+                    outData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+                    group.leave()
+                }
+                
+                group.enter()
+                DispatchQueue.global(qos: .userInitiated).async {
+                    errData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+                    group.leave()
+                }
+                
+                process.waitUntilExit()
+                group.wait()
                 
                 let stdout = String(data: outData, encoding: .utf8) ?? ""
                 let stderr = String(data: errData, encoding: .utf8) ?? ""

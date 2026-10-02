@@ -1,176 +1,221 @@
 import AppKit
+import Combine
 
 public final class DiagnosticsViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate {
     private let diagnostics = DiagnosticsRunner()
+    private var cancellables = Set<AnyCancellable>()
     
-    private let summaryBox = NSBox()
-    private let summaryLabel = NSTextField(labelWithString: "Ready to run Darwin Mach-O diagnostics.")
+    // Header & Summary Elements
+    private let statusPill = StatusPillView(text: "Ready", color: .systemGray)
+    private let summaryLabel = NSTextField(labelWithString: "Ready to execute Darwin Mach-O system diagnostic suite.")
     private let runButton = NSButton()
+    private let exportButton = NSButton()
     private let progressIndicator = NSProgressIndicator()
+    
+    // Results Table
     private let tableView = NSTableView()
     
     public override func loadView() {
-        let root = FlippedView(frame: NSRect(x: 0, y: 0, width: 880, height: 750))
-        root.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            root.widthAnchor.constraint(greaterThanOrEqualToConstant: 800),
-            root.heightAnchor.constraint(greaterThanOrEqualToConstant: 680)
-        ])
+        let root = FlippedView(frame: NSRect(x: 0, y: 0, width: 1140, height: 750))
+        root.autoresizingMask = [.width, .height]
         self.view = root
     }
+    
     public override func viewDidLoad() {
         super.viewDidLoad()
         setupUI()
+        bindViewModel()
+        diagnostics.runDiagnostics()
     }
     
     private func setupUI() {
-        // Header
-        let titleLabel = NSTextField(labelWithString: "Darwin System Diagnostics")
-        titleLabel.font = .systemFont(ofSize: 18, weight: .bold)
-        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        // Header Box
+        let headerBox = NSBox()
+        headerBox.boxType = .custom
+        headerBox.borderWidth = 1
+        headerBox.borderColor = NSColor.separatorColor.withAlphaComponent(0.35)
+        headerBox.cornerRadius = 10
+        headerBox.fillColor = NSColor.controlBackgroundColor.withAlphaComponent(0.45)
+        headerBox.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(headerBox)
         
-        let subLabel = NSTextField(labelWithString: "Verify Darwin Mach kernel APIs, memory management, and shared cache symbol resolution.")
-        subLabel.font = .systemFont(ofSize: 12)
+        let titleLabel = NSTextField(labelWithString: "Darwin Mach-O Diagnostics")
+        titleLabel.font = .systemFont(ofSize: 16, weight: .bold)
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        headerBox.addSubview(titleLabel)
+        
+        let subLabel = NSTextField(labelWithString: "Verify Darwin kernel primitives: Mach VM allocation, task ports, symbol resolution & process inspection.")
+        subLabel.font = .systemFont(ofSize: 11)
         subLabel.textColor = .secondaryLabelColor
         subLabel.translatesAutoresizingMaskIntoConstraints = false
+        headerBox.addSubview(subLabel)
         
-        runButton.title = "  Run Diagnostic Suite"
+        statusPill.translatesAutoresizingMaskIntoConstraints = false
+        headerBox.addSubview(statusPill)
+        
+        runButton.title = "Run Diagnostics"
         runButton.image = NSImage(systemSymbolName: "stethoscope", accessibilityDescription: nil)
-        runButton.bezelStyle = .regularSquare
-        runButton.wantsLayer = true
-        runButton.layer?.backgroundColor = NSColor.systemCyan.cgColor
-        runButton.layer?.cornerRadius = 6
-        runButton.contentTintColor = .black
-        runButton.font = .systemFont(ofSize: 13, weight: .bold)
+        runButton.imagePosition = .imageLeading
+        runButton.bezelStyle = .rounded
+        runButton.contentTintColor = .controlAccentColor
+        runButton.font = .systemFont(ofSize: 12, weight: .bold)
         runButton.target = self
         runButton.action = #selector(handleRunDiagnostics)
         runButton.translatesAutoresizingMaskIntoConstraints = false
+        headerBox.addSubview(runButton)
+        
+        exportButton.title = "Export Report"
+        exportButton.image = NSImage(systemSymbolName: "square.and.arrow.up", accessibilityDescription: nil)
+        exportButton.imagePosition = .imageLeading
+        exportButton.bezelStyle = .rounded
+        exportButton.target = self
+        exportButton.action = #selector(handleExportReport)
+        exportButton.translatesAutoresizingMaskIntoConstraints = false
+        headerBox.addSubview(exportButton)
         
         progressIndicator.style = .spinning
-        progressIndicator.isDisplayedWhenStopped = false
         progressIndicator.controlSize = .small
+        progressIndicator.isDisplayedWhenStopped = false
         progressIndicator.translatesAutoresizingMaskIntoConstraints = false
+        headerBox.addSubview(progressIndicator)
         
-        // Summary Box
-        summaryBox.boxType = .custom
-        summaryBox.borderWidth = 1
-        summaryBox.borderColor = .separatorColor
-        summaryBox.cornerRadius = 8
-        summaryBox.fillColor = NSColor.controlBackgroundColor.withAlphaComponent(0.4)
-        summaryBox.translatesAutoresizingMaskIntoConstraints = false
-        
-        summaryLabel.font = .systemFont(ofSize: 13, weight: .medium)
-        summaryLabel.lineBreakMode = .byWordWrapping
+        summaryLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        summaryLabel.textColor = .labelColor
         summaryLabel.translatesAutoresizingMaskIntoConstraints = false
-        summaryBox.addSubview(summaryLabel)
+        headerBox.addSubview(summaryLabel)
         
-        NSLayoutConstraint.activate([
-            summaryLabel.topAnchor.constraint(equalTo: summaryBox.topAnchor, constant: 12),
-            summaryLabel.leadingAnchor.constraint(equalTo: summaryBox.leadingAnchor, constant: 14),
-            summaryLabel.trailingAnchor.constraint(equalTo: summaryBox.trailingAnchor, constant: -14),
-            summaryLabel.bottomAnchor.constraint(equalTo: summaryBox.bottomAnchor, constant: -12)
-        ])
-        
-        // Table View for Tests
+        // Table View for Test Results
         let scrollView = NSScrollView()
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.hasVerticalScroller = true
         scrollView.borderType = .bezelBorder
+        scrollView.autohidesScrollers = true
+        view.addSubview(scrollView)
         
         tableView.dataSource = self
         tableView.delegate = self
-        tableView.rowHeight = 36
+        tableView.rowHeight = 32
         tableView.usesAlternatingRowBackgroundColors = true
         
         let statusCol = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("status"))
         statusCol.title = "Result"
-        statusCol.width = 80
+        statusCol.width = 90
         tableView.addTableColumn(statusCol)
         
+        let idCol = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("id"))
+        idCol.title = "#"
+        idCol.width = 40
+        tableView.addTableColumn(idCol)
+        
         let titleCol = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("title"))
-        titleCol.title = "Diagnostic Test"
-        titleCol.width = 280
+        titleCol.title = "Diagnostic Target & Kernel Primitive"
+        titleCol.width = 380
         tableView.addTableColumn(titleCol)
         
         let detailsCol = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("details"))
-        detailsCol.title = "Details"
-        detailsCol.width = 300
+        detailsCol.title = "Detailed Output & Status"
+        detailsCol.width = 480
         tableView.addTableColumn(detailsCol)
         
         scrollView.documentView = tableView
         
-        view.addSubview(titleLabel)
-        view.addSubview(subLabel)
-        view.addSubview(runButton)
-        view.addSubview(progressIndicator)
-        view.addSubview(summaryBox)
-        view.addSubview(scrollView)
-        
         NSLayoutConstraint.activate([
-            titleLabel.topAnchor.constraint(equalTo: view.topAnchor, constant: 18),
-            titleLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
+            headerBox.topAnchor.constraint(equalTo: view.topAnchor, constant: 14),
+            headerBox.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
+            headerBox.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
+            headerBox.heightAnchor.constraint(equalToConstant: 92),
             
-            subLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 4),
+            titleLabel.topAnchor.constraint(equalTo: headerBox.topAnchor, constant: 12),
+            titleLabel.leadingAnchor.constraint(equalTo: headerBox.leadingAnchor, constant: 14),
+            
+            statusPill.leadingAnchor.constraint(equalTo: titleLabel.trailingAnchor, constant: 10),
+            statusPill.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
+            
+            subLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 2),
             subLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
             
-            runButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
+            summaryLabel.topAnchor.constraint(equalTo: subLabel.bottomAnchor, constant: 8),
+            summaryLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+            
+            exportButton.trailingAnchor.constraint(equalTo: headerBox.trailingAnchor, constant: -14),
+            exportButton.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
+            
+            runButton.trailingAnchor.constraint(equalTo: exportButton.leadingAnchor, constant: -8),
             runButton.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
-            runButton.widthAnchor.constraint(equalToConstant: 190),
-            runButton.heightAnchor.constraint(equalToConstant: 32),
             
-            progressIndicator.trailingAnchor.constraint(equalTo: runButton.leadingAnchor, constant: -10),
-            progressIndicator.centerYAnchor.constraint(equalTo: runButton.centerYAnchor),
+            progressIndicator.trailingAnchor.constraint(equalTo: runButton.leadingAnchor, constant: -8),
+            progressIndicator.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
             
-            summaryBox.topAnchor.constraint(equalTo: subLabel.bottomAnchor, constant: 14),
-            summaryBox.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
-            summaryBox.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
-            
-            scrollView.topAnchor.constraint(equalTo: summaryBox.bottomAnchor, constant: 14),
-            scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
-            scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
-            scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -20)
+            scrollView.topAnchor.constraint(equalTo: headerBox.bottomAnchor, constant: 12),
+            scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
+            scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
+            scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -14)
         ])
     }
     
-    @objc private func handleRunDiagnostics() {
-        runButton.isEnabled = false
-        progressIndicator.startAnimation(nil)
-        summaryLabel.stringValue = "Running diagnostic test suite..."
-        summaryLabel.textColor = .labelColor
-        summaryBox.borderColor = .separatorColor
-        summaryBox.fillColor = NSColor.controlBackgroundColor.withAlphaComponent(0.4)
-        
-        diagnostics.runDiagnostics()
-        
-        // Poll for completion
-        Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] timer in
-            Task { @MainActor [weak self] in
-                guard let self = self else {
-                    timer.invalidate()
-                    return
-                }
-                if !self.diagnostics.isRunning {
-                    timer.invalidate()
-                    self.runButton.isEnabled = true
-                    self.progressIndicator.stopAnimation(nil)
-                    self.summaryLabel.stringValue = self.diagnostics.summary
-                    
-                    if let allPassed = self.diagnostics.allPassed {
-                        if allPassed {
-                            self.summaryLabel.textColor = .systemGreen
-                            self.summaryBox.borderColor = .systemGreen
-                            self.summaryBox.fillColor = NSColor.systemGreen.withAlphaComponent(0.1)
-                        } else {
-                            self.summaryLabel.textColor = .systemRed
-                            self.summaryBox.borderColor = .systemRed
-                            self.summaryBox.fillColor = NSColor.systemRed.withAlphaComponent(0.1)
-                        }
-                    }
-                    
-                    self.tableView.reloadData()
+    private func bindViewModel() {
+        diagnostics.$isRunning
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] isRunning in
+                self?.runButton.isEnabled = !isRunning
+                if isRunning {
+                    self?.progressIndicator.startAnimation(nil)
+                    self?.statusPill.update(text: "Running...", color: .systemOrange)
+                } else {
+                    self?.progressIndicator.stopAnimation(nil)
                 }
             }
-        }
+            .store(in: &cancellables)
+        
+        diagnostics.$items
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.tableView.reloadData()
+            }
+            .store(in: &cancellables)
+        
+        diagnostics.$summary
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] sum in
+                self?.summaryLabel.stringValue = sum
+            }
+            .store(in: &cancellables)
+        
+        diagnostics.$allPassed
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] allPassed in
+                guard let self = self, let passed = allPassed else { return }
+                if passed {
+                    self.statusPill.update(text: "All Passed", color: .systemGreen)
+                } else {
+                    self.statusPill.update(text: "Failed", color: .systemRed)
+                }
+            }
+            .store(in: &cancellables)
+    }
+    
+    @objc private func handleRunDiagnostics() {
+        diagnostics.runDiagnostics()
+    }
+    
+    @objc private func handleExportReport() {
+        let lines = diagnostics.items.map { "[\($0.passed ? "PASS" : "FAIL")] #\($0.id): \($0.title) -> \($0.details)" }
+        let report = """
+        === Rux Darwin Mach-O Diagnostics Report ===
+        Summary: \(diagnostics.summary)
+        Total Tests: \(diagnostics.items.count)
+        
+        \(lines.joined(separator: "\n"))
+        """
+        
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(report, forType: .string)
+        
+        let alert = NSAlert()
+        alert.messageText = "Diagnostic Report Copied"
+        alert.informativeText = "The full diagnostic report has been copied to your clipboard."
+        alert.runModal()
     }
     
     // MARK: - NSTableViewDataSource & Delegate
@@ -182,46 +227,35 @@ public final class DiagnosticsViewController: NSViewController, NSTableViewDataS
     public func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         guard row >= 0 && row < diagnostics.items.count else { return nil }
         let item = diagnostics.items[row]
-        let colId = tableColumn?.identifier.rawValue ?? ""
+        let identifier = tableColumn?.identifier.rawValue ?? ""
         
-        let cellId = NSUserInterfaceItemIdentifier("cell_\(colId)")
-        var cell = tableView.makeView(withIdentifier: cellId, owner: nil) as? NSTableCellView
-        
-        if cell == nil {
-            cell = NSTableCellView()
-            cell?.identifier = cellId
-            let tf = NSTextField(labelWithString: "")
-            tf.translatesAutoresizingMaskIntoConstraints = false
-            tf.isBordered = false
-            tf.backgroundColor = .clear
-            cell?.addSubview(tf)
-            cell?.textField = tf
-            
-            NSLayoutConstraint.activate([
-                tf.leadingAnchor.constraint(equalTo: cell!.leadingAnchor, constant: 6),
-                tf.trailingAnchor.constraint(equalTo: cell!.trailingAnchor, constant: -6),
-                tf.centerYAnchor.constraint(equalTo: cell!.centerYAnchor)
-            ])
-        }
-        
-        let tf = cell?.textField
-        switch colId {
+        switch identifier {
         case "status":
-            tf?.stringValue = item.passed ? "✓ PASS" : "✕ FAIL"
-            tf?.font = .systemFont(ofSize: 12, weight: .bold)
-            tf?.textColor = item.passed ? .systemGreen : .systemRed
+            let pill = StatusPillView(
+                text: item.passed ? "PASS" : "FAIL",
+                color: item.passed ? .systemGreen : .systemRed
+            )
+            return pill
+            
+        case "id":
+            let cell = NSTextField(labelWithString: "#\(item.id)")
+            cell.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+            cell.textColor = .secondaryLabelColor
+            return cell
+            
         case "title":
-            tf?.stringValue = item.title
-            tf?.font = .systemFont(ofSize: 12, weight: .medium)
-            tf?.textColor = .labelColor
+            let cell = NSTextField(labelWithString: item.title)
+            cell.font = .systemFont(ofSize: 12, weight: .medium)
+            return cell
+            
         case "details":
-            tf?.stringValue = item.details
-            tf?.font = .systemFont(ofSize: 11)
-            tf?.textColor = .secondaryLabelColor
+            let cell = NSTextField(labelWithString: item.details)
+            cell.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+            cell.textColor = item.passed ? .labelColor : .systemRed
+            return cell
+            
         default:
-            break
+            return nil
         }
-        
-        return cell
     }
 }

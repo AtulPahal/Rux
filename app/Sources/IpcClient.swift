@@ -8,7 +8,7 @@ public final class IpcClient: ObservableObject {
     @Published public var host: String = "127.0.0.1"
     @Published public var portText: String = "5553"
     @Published public private(set) var isBusy: Bool = false
-    
+    @Published public private(set) var latestTelemetry: PayloadTelemetry? = nil
     public init() {}
     
     public var port: in_port_t {
@@ -22,13 +22,32 @@ public final class IpcClient: ObservableObject {
         
         LogStore.shared.log(.info, "Pinging IPC payload at \(targetHost):\(targetPort)...")
         
-        let success = await Task.detached(priority: .userInitiated) {
+        var success = await Task.detached(priority: .userInitiated) {
             Self.sendPing(host: targetHost, port: targetPort)
         }.value
         
+        var connectedPort = targetPort
+        // Auto-probe fallback if default 5553 failed
+        if !success && targetPort == 5553 {
+            for probePort in 5554...5563 {
+                let p = in_port_t(probePort)
+                let ok = await Task.detached(priority: .userInitiated) {
+                    Self.sendPing(host: targetHost, port: p)
+                }.value
+                if ok {
+                    success = true
+                    connectedPort = p
+                    self.portText = "\(p)"
+                    break
+                }
+            }
+        }
+        
         if success {
-            status = .connected(port: Int(targetPort))
-            LogStore.shared.log(.success, "IPC Payload is ONLINE and responsive at \(targetHost):\(targetPort) (PONG 0x10 received)")
+            status = .connected(port: Int(connectedPort))
+            LogStore.shared.log(.success, "IPC Payload is ONLINE and responsive at \(targetHost):\(connectedPort) (PONG 0x10 received)")
+            // Auto-fetch telemetry after ping
+            _ = await fetchTelemetry()
         } else {
             status = .disconnected
             LogStore.shared.log(.warning, "IPC Payload is OFFLINE at \(targetHost):\(targetPort) (connection refused or timed out)")
@@ -36,6 +55,21 @@ public final class IpcClient: ObservableObject {
         
         isBusy = false
         return success
+    }
+    
+    public func fetchTelemetry() async -> PayloadTelemetry? {
+        let targetHost = host
+        let targetPort = port
+        
+        let telemetry = await Task.detached(priority: .userInitiated) {
+            Self.queryTelemetry(host: targetHost, port: targetPort)
+        }.value
+        
+        if let t = telemetry {
+            self.latestTelemetry = t
+            LogStore.shared.log(.info, "Telemetry fetched: target PID \(t.targetPid), uptime \(t.formattedUptime), memory \(t.formattedMemory)")
+        }
+        return telemetry
     }
     
     public func executeScript(_ script: String) async -> Bool {
@@ -96,25 +130,65 @@ public final class IpcClient: ObservableObject {
         let sock = socket(AF_INET, SOCK_STREAM, 0)
         guard sock >= 0 else { return nil }
         
-        var timeout = timeval(tv_sec: timeoutSec, tv_usec: 0)
-        _ = setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
-        _ = setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        // 1. Prevent SIGPIPE crash
+        var nosigpipe: Int32 = 1
+        setsockopt(sock, SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe, socklen_t(MemoryLayout<Int32>.size))
+        
+        // 2. Resolve host safely
+        var resolvedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        if resolvedHost == "localhost" || resolvedHost.isEmpty {
+            resolvedHost = "127.0.0.1"
+        }
         
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
         addr.sin_port = port.bigEndian
-        addr.sin_addr.s_addr = inet_addr(host)
+        if inet_pton(AF_INET, resolvedHost, &addr.sin_addr) <= 0 {
+            close(sock)
+            return nil
+        }
         
-        let res = withUnsafePointer(to: &addr) {
+        // 3. Non-blocking connect with poll timeout
+        let origFlags = fcntl(sock, F_GETFL, 0)
+        if origFlags != -1 {
+            _ = fcntl(sock, F_SETFL, origFlags | O_NONBLOCK)
+        }
+        
+        let connRes = withUnsafePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                 connect(sock, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
         }
         
-        if res < 0 {
+        if connRes < 0 && errno != EINPROGRESS {
             close(sock)
             return nil
         }
+        
+        if connRes != 0 {
+            var pfd = pollfd(fd: sock, events: Int16(POLLOUT), revents: 0)
+            let pollRet = poll(&pfd, 1, Int32(timeoutSec * 1000))
+            if pollRet <= 0 {
+                close(sock)
+                return nil
+            }
+            
+            var soError: Int32 = 0
+            var len = socklen_t(MemoryLayout<Int32>.size)
+            if getsockopt(sock, SOL_SOCKET, SO_ERROR, &soError, &len) < 0 || soError != 0 {
+                close(sock)
+                return nil
+            }
+        }
+        
+        // Restore blocking flags
+        if origFlags != -1 {
+            _ = fcntl(sock, F_SETFL, origFlags)
+        }
+        
+        var timeout = timeval(tv_sec: timeoutSec, tv_usec: 0)
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
         
         return sock
     }
@@ -131,20 +205,44 @@ public final class IpcClient: ObservableObject {
         return header
     }
     
+    private nonisolated static func sendAll(sock: Int32, data: [UInt8]) -> Bool {
+        var totalSent = 0
+        while totalSent < data.count {
+            let remaining = data.count - totalSent
+            let sent = data.withUnsafeBytes { ptr in
+                send(sock, ptr.baseAddress! + totalSent, remaining, 0)
+            }
+            if sent <= 0 { return false }
+            totalSent += sent
+        }
+        return true
+    }
+    
+    private nonisolated static func recvExact(sock: Int32, count: Int) -> [UInt8]? {
+        var buffer = [UInt8](repeating: 0, count: count)
+        var totalRecvd = 0
+        while totalRecvd < count {
+            let remaining = count - totalRecvd
+            let recvd = buffer.withUnsafeMutableBytes { ptr in
+                recv(sock, ptr.baseAddress! + totalRecvd, remaining, 0)
+            }
+            if recvd <= 0 { return nil }
+            totalRecvd += recvd
+        }
+        return buffer
+    }
+    
     private nonisolated static func sendPing(host: String, port: in_port_t) -> Bool {
         guard let sock = createSocket(host: host, port: port, timeoutSec: 1) else {
             return false
         }
         defer { close(sock) }
         
-        // Header: msg_type = 2 (IPC_PING), size = 0
         let header = makeHeader(msgType: 2, size: 0)
-        let sent = send(sock, header, header.count, 0)
-        guard sent == header.count else { return false }
+        guard sendAll(sock: sock, data: header) else { return false }
         
         var responseByte: UInt8 = 0
         let recvd = recv(sock, &responseByte, 1, 0)
-        // Expected PONG_BYTE = 0x10
         return recvd == 1 && responseByte == 0x10
     }
     
@@ -157,11 +255,8 @@ public final class IpcClient: ObservableObject {
         let scriptBytes = [UInt8](script.utf8)
         let header = makeHeader(msgType: 0, size: UInt64(scriptBytes.count))
         
-        let headerSent = send(sock, header, header.count, 0)
-        guard headerSent == header.count else { return false }
-        
-        let bodySent = send(sock, scriptBytes, scriptBytes.count, 0)
-        return bodySent == scriptBytes.count
+        guard sendAll(sock: sock, data: header) else { return false }
+        return sendAll(sock: sock, data: scriptBytes)
     }
     
     private nonisolated static func sendSettingRaw(host: String, port: in_port_t, payload: String) -> Bool {
@@ -173,10 +268,34 @@ public final class IpcClient: ObservableObject {
         let payloadBytes = [UInt8](payload.utf8)
         let header = makeHeader(msgType: 1, size: UInt64(payloadBytes.count))
         
-        let headerSent = send(sock, header, header.count, 0)
-        guard headerSent == header.count else { return false }
+        guard sendAll(sock: sock, data: header) else { return false }
+        return sendAll(sock: sock, data: payloadBytes)
+    }
+    
+    private nonisolated static func queryTelemetry(host: String, port: in_port_t) -> PayloadTelemetry? {
+        guard let sock = createSocket(host: host, port: port, timeoutSec: 2) else {
+            return nil
+        }
+        defer { close(sock) }
         
-        let bodySent = send(sock, payloadBytes, payloadBytes.count, 0)
-        return bodySent == payloadBytes.count
+        // Header: msg_type = 3 (IPC_MSG_TELEMETRY), size = 0
+        let header = makeHeader(msgType: 3, size: 0)
+        guard sendAll(sock: sock, data: header) else { return nil }
+        
+        guard let respHeader = recvExact(sock: sock, count: 16) else { return nil }
+        guard respHeader[0] == 3 else { return nil }
+        
+        var size: UInt64 = 0
+        withUnsafeMutableBytes(of: &size) { rawBytes in
+            for i in 0..<8 {
+                rawBytes[i] = respHeader[8 + i]
+            }
+        }
+        size = UInt64(littleEndian: size)
+        guard size > 0 && size < 1024 * 1024 else { return nil }
+        
+        guard let jsonBytes = recvExact(sock: sock, count: Int(size)) else { return nil }
+        let data = Data(jsonBytes)
+        return try? JSONDecoder().decode(PayloadTelemetry.self, from: data)
     }
 }

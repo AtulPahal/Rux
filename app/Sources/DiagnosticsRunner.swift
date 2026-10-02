@@ -31,46 +31,76 @@ public final class DiagnosticsRunner: ObservableObject {
         }
         
         Task.detached(priority: .userInitiated) {
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: ruxPath)
-            process.arguments = ["test"]
+            let (exitCode, output) = Self.runDiagnosticsProcess(executable: ruxPath)
             
-            let pipe = Pipe()
-            process.standardOutput = pipe
-            process.standardError = pipe
-            
-            var output = ""
-            do {
-                try process.run()
-                process.waitUntilExit()
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                output = String(data: data, encoding: .utf8) ?? ""
-            } catch {
-                output = "Error launching diagnostics: \(error.localizedDescription)"
+            var (parsedItems, passCount, failCount) = Self.parseTestOutput(output)
+            if parsedItems.isEmpty {
+                let errorDetails = output.trimmingCharacters(in: .whitespacesAndNewlines)
+                let details = errorDetails.isEmpty ? "Diagnostic process terminated with exit code \(exitCode)." : errorDetails
+                parsedItems.append(DiagnosticItem(
+                    id: 1,
+                    title: "Diagnostic Execution Failure",
+                    passed: false,
+                    details: details
+                ))
+                failCount = 1
             }
             
-            let (parsedItems, passCount, failCount) = Self.parseTestOutput(output)
-            let exitCode = process.terminationStatus
-            let capturedOutput = output
+            let finalItems = parsedItems
+            let finalPass = passCount
+            let finalFail = failCount
+            let finalExit = exitCode
+            let finalOutput = output
             
             await MainActor.run {
-                self.items = parsedItems
-                let total = passCount + failCount
-                if total > 0 && failCount == 0 {
+                self.items = finalItems
+                let total = finalPass + finalFail
+                if total > 0 && finalFail == 0 {
                     self.allPassed = true
-                    self.summary = "All \(passCount) diagnostic tests PASSED successfully!"
-                    LogStore.shared.log(.success, "Diagnostics completed: \(passCount)/\(total) passed.")
+                    self.summary = "All \(finalPass) diagnostic tests PASSED successfully!"
+                    LogStore.shared.log(.success, "Diagnostics completed: \(finalPass)/\(total) passed.")
                 } else if total > 0 {
                     self.allPassed = false
-                    self.summary = "Diagnostic failure: \(failCount) failed, \(passCount) passed."
-                    LogStore.shared.log(.error, "Diagnostics completed: \(failCount) failed.")
+                    self.summary = "Diagnostic failure: \(finalFail) failed, \(finalPass) passed."
+                    LogStore.shared.log(.error, "Diagnostics completed: \(finalFail) failed.")
                 } else {
                     self.allPassed = false
-                    self.summary = "Diagnostics finished with exit code \(exitCode)."
-                    LogStore.shared.log(.warning, "Diagnostic output:\n\(capturedOutput)")
+                    self.summary = "Diagnostics finished with exit code \(finalExit)."
+                    LogStore.shared.log(.warning, "Diagnostic output:\n\(finalOutput)")
                 }
                 self.isRunning = false
             }
+        }
+    }
+    
+    private nonisolated static func runDiagnosticsProcess(executable: String) -> (exitCode: Int32, output: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = ["test"]
+        
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        
+        do {
+            try process.run()
+            
+            var pipeData = Data()
+            let group = DispatchGroup()
+            group.enter()
+            DispatchQueue.global(qos: .userInitiated).async {
+                pipeData = pipe.fileHandleForReading.readDataToEndOfFile()
+                group.leave()
+            }
+            
+            process.waitUntilExit()
+            group.wait()
+            
+            let exitCode = process.terminationStatus
+            let output = String(data: pipeData, encoding: .utf8) ?? ""
+            return (exitCode, output)
+        } catch {
+            return (-1, "Error launching diagnostics: \(error.localizedDescription)")
         }
     }
     

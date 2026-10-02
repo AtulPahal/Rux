@@ -1,53 +1,126 @@
 import AppKit
+import Combine
 
 public final class InjectorViewController: NSViewController {
     public var onSwitchToProcesses: (() -> Void)?
     
     private let injectorService = InjectorService()
+    private var cancellables = Set<AnyCancellable>()
     
-    // UI Elements - Target Process
+    // Target Selection Mode
+    private let targetModeSegmented = NSSegmentedControl(labels: ["Target by Name", "Target by PID"], trackingMode: .selectOne, target: nil, action: nil)
     private let processNameField = NSTextField()
     private let pidField = NSTextField()
-    private let targetInfoLabel = NSTextField(labelWithString: "Configured target: RobloxPlayer")
+    private let browseProcessesButton = NSButton()
     
-    // UI Elements - Dylib
+    // Target Preview & Security Info
+    private let targetPreviewBox = NSBox()
+    private let targetIconView = NSImageView()
+    private let targetTitleLabel = NSTextField(labelWithString: "Target: RobloxPlayer")
+    private let targetSubtitleLabel = NSTextField(labelWithString: "Default target binary name")
+    private let targetArchPill = StatusPillView(text: "ARM64", color: .systemPurple)
+    private let targetSecPill = StatusPillView(text: "Standard", color: .systemGray, dotVisible: false)
+    
+    // Dylib Selection & Live Mach-O Inspector
     private let dylibPathField = NSTextField()
-    private let dylibStatusLabel = NSTextField(labelWithString: "")
+    private let browseDylibButton = NSButton()
+    private let useBundledButton = NSButton()
     
-    // UI Elements - Options
+    // Mach-O Inspector Card
+    private let inspectorGroup = GroupSectionView(title: "Live Payload Mach-O Inspector", subtitle: "Architecture slices, dependencies & signature", iconName: "doc.badge.gearshape")
+    private let dylibNameLabel = NSTextField(labelWithString: "No payload selected")
+    private let dylibCompatBadge = StatusPillView(text: "Pending", color: .secondaryLabelColor)
+    private let dylibArchSlicesLabel = NSTextField(labelWithString: "Slices: -")
+    private let dylibInstallNameLabel = NSTextField(labelWithString: "Install Name: -")
+    private let dylibDepsLabel = NSTextField(labelWithString: "Dependencies: -")
+    private let dylibSignatureLabel = NSTextField(labelWithString: "Signature: -")
+    private var currentInspection: DylibInspectionResult? = nil
+    
+    // Execution Options
     private let modePopup = NSPopUpButton()
     private let timeoutSlider = NSSlider()
     private let timeoutLabel = NSTextField(labelWithString: "3000 ms")
     private let waitCompletionCheckbox = NSButton(checkboxWithTitle: "Wait for remote thread & dlopen() completion", target: nil, action: nil)
     private let verboseCheckbox = NSButton(checkboxWithTitle: "Enable verbose Mach diagnostic logs", target: nil, action: nil)
-    private let adminCheckbox = NSButton(checkboxWithTitle: "Authenticate as Administrator (Touch ID / Password)", target: nil, action: nil)
+    private let adminCheckbox = NSButton(checkboxWithTitle: "Authenticate with Administrator privileges (Touch ID / sudo)", target: nil, action: nil)
     
-    // UI Elements - Action
+    // Pre-Flight Security Check Banner
+    private let preflightBox = NSBox()
+    private let preflightLabel = NSTextField(labelWithString: "Pre-Flight Status: Ready to inject.")
+    
+    // Action Section
     private let injectButton = NSButton()
     private let progressIndicator = NSProgressIndicator()
     private let resultBox = NSBox()
     private let resultLabel = NSTextField(labelWithString: "")
     
+    // Target tracking
+    private var currentTargetArch: CpuArch = .arm64
+    private var currentTargetPid: Int32? = nil
+    
     public override func loadView() {
-        let root = FlippedView(frame: NSRect(x: 0, y: 0, width: 880, height: 750))
-        root.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            root.widthAnchor.constraint(greaterThanOrEqualToConstant: 800),
-            root.heightAnchor.constraint(greaterThanOrEqualToConstant: 680)
-        ])
+        let root = FlippedView(frame: NSRect(x: 0, y: 0, width: 1140, height: 750))
+        root.autoresizingMask = [.width, .height]
         self.view = root
     }
     
     public override func viewDidLoad() {
         super.viewDidLoad()
         setupUI()
+        bindViewModel()
+        loadDefaultPayload()
     }
     
     public func selectProcess(pid: Int32, name: String, arch: String) {
+        targetModeSegmented.selectedSegment = 1
+        handleTargetModeChanged()
+        
         pidField.stringValue = "\(pid)"
         processNameField.stringValue = name
-        targetInfoLabel.stringValue = "✓ Target selected: \(name) (PID: \(pid), Arch: \(arch.uppercased()))"
-        targetInfoLabel.textColor = .systemGreen
+        
+        currentTargetPid = pid
+        currentTargetArch = (arch.lowercased() == "arm64") ? .arm64 : ((arch.lowercased() == "x86_64") ? .x86_64 : .unknown)
+        
+        targetTitleLabel.stringValue = "\(name) (PID: \(pid))"
+        targetSubtitleLabel.stringValue = "Target selected from Process Explorer"
+        targetArchPill.update(text: arch.uppercased(), color: (currentTargetArch == .arm64) ? .systemPurple : .systemCyan)
+        
+        if let app = NSRunningApplication(processIdentifier: pid), let icon = app.icon {
+            targetIconView.image = icon
+        } else {
+            targetIconView.image = NSImage(systemSymbolName: "cpu", accessibilityDescription: nil)
+        }
+        
+        // Deep Fetch security for preflight
+        Task.detached(priority: .userInitiated) {
+            let sec = ProcessInspection.fetchSecurity(pid: pid)
+            await MainActor.run {
+                if let sec = sec {
+                    if sec.requiresLibraryValidation && !sec.hasGetTaskAllow {
+                        self.targetSecPill.update(text: "Library Validation", color: .systemOrange, dotVisible: false)
+                        self.preflightLabel.stringValue = "⚠️ Pre-Flight Alert: Target enforces Library Validation (CS_REQUIRE_LV). Injection of third-party dylibs may be blocked by kernel."
+                        self.preflightBox.borderColor = NSColor.systemOrange.withAlphaComponent(0.6)
+                        self.preflightLabel.textColor = .systemOrange
+                    } else if sec.isHardenedRuntime && !sec.hasGetTaskAllow {
+                        self.targetSecPill.update(text: "Hardened Runtime", color: .systemRed, dotVisible: false)
+                        self.preflightLabel.stringValue = "⛔ Target has Hardened Runtime without get-task-allow. Injection will fail unless SIP debugging restrictions are disabled (csrutil enable --without debug in Recovery OS)."
+                        self.preflightBox.borderColor = NSColor.systemRed.withAlphaComponent(0.6)
+                        self.preflightLabel.textColor = .systemRed
+                    } else if sec.hasGetTaskAllow {
+                        self.targetSecPill.update(text: "Debuggable", color: .systemGreen, dotVisible: false)
+                        self.preflightLabel.stringValue = "✓ Target is debuggable (get-task-allow). Pre-flight checks passed."
+                        self.preflightBox.borderColor = NSColor.systemGreen.withAlphaComponent(0.6)
+                        self.preflightLabel.textColor = .systemGreen
+                    } else {
+                        self.targetSecPill.update(text: "Standard", color: .systemGray, dotVisible: false)
+                        self.preflightLabel.stringValue = "✓ Target process ready for dynamic library injection."
+                        self.preflightBox.borderColor = NSColor.separatorColor.withAlphaComponent(0.3)
+                        self.preflightLabel.textColor = .secondaryLabelColor
+                    }
+                }
+                self.revalidateCompatibility()
+            }
+        }
     }
     
     private func setupUI() {
@@ -76,19 +149,19 @@ public final class InjectorViewController: NSViewController {
             documentView.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor)
         ])
         
-        // 1. Header Banner
+        // 1. Header View
         let headerView = createHeaderView()
         documentView.addSubview(headerView)
         
-        // 2. Card 1: Target Process
+        // 2. Target Process Card
         let processCard = createProcessCard()
         documentView.addSubview(processCard)
         
-        // 3. Card 2: Dylib Payload
+        // 3. Payload Dylib & Live Mach-O Inspector Card
         let dylibCard = createDylibCard()
         documentView.addSubview(dylibCard)
         
-        // 4. Card 3: Options & Privileges
+        // 4. Execution Options Card
         let optionsCard = createOptionsCard()
         documentView.addSubview(optionsCard)
         
@@ -97,236 +170,274 @@ public final class InjectorViewController: NSViewController {
         documentView.addSubview(actionView)
         
         NSLayoutConstraint.activate([
-            headerView.topAnchor.constraint(equalTo: documentView.topAnchor, constant: 18),
+            headerView.topAnchor.constraint(equalTo: documentView.topAnchor, constant: 16),
             headerView.leadingAnchor.constraint(equalTo: documentView.leadingAnchor, constant: 24),
             headerView.trailingAnchor.constraint(equalTo: documentView.trailingAnchor, constant: -24),
             
-            processCard.topAnchor.constraint(equalTo: headerView.bottomAnchor, constant: 14),
+            processCard.topAnchor.constraint(equalTo: headerView.bottomAnchor, constant: 12),
             processCard.leadingAnchor.constraint(equalTo: documentView.leadingAnchor, constant: 24),
             processCard.trailingAnchor.constraint(equalTo: documentView.trailingAnchor, constant: -24),
             
-            dylibCard.topAnchor.constraint(equalTo: processCard.bottomAnchor, constant: 14),
+            dylibCard.topAnchor.constraint(equalTo: processCard.bottomAnchor, constant: 12),
             dylibCard.leadingAnchor.constraint(equalTo: documentView.leadingAnchor, constant: 24),
             dylibCard.trailingAnchor.constraint(equalTo: documentView.trailingAnchor, constant: -24),
             
-            optionsCard.topAnchor.constraint(equalTo: dylibCard.bottomAnchor, constant: 14),
+            optionsCard.topAnchor.constraint(equalTo: dylibCard.bottomAnchor, constant: 12),
             optionsCard.leadingAnchor.constraint(equalTo: documentView.leadingAnchor, constant: 24),
             optionsCard.trailingAnchor.constraint(equalTo: documentView.trailingAnchor, constant: -24),
             
             actionView.topAnchor.constraint(equalTo: optionsCard.bottomAnchor, constant: 16),
             actionView.leadingAnchor.constraint(equalTo: documentView.leadingAnchor, constant: 24),
             actionView.trailingAnchor.constraint(equalTo: documentView.trailingAnchor, constant: -24),
-            actionView.bottomAnchor.constraint(equalTo: documentView.bottomAnchor, constant: -28)
+            actionView.bottomAnchor.constraint(equalTo: documentView.bottomAnchor, constant: -24)
         ])
-        
-        // Default initial values
-        processNameField.stringValue = "RobloxPlayer"
-        if let dylib = injectorService.resolveDefaultDylib() {
-            dylibPathField.stringValue = dylib
-            dylibStatusLabel.stringValue = "✓ Bundled payload verified: \(dylib)"
-            dylibStatusLabel.textColor = .systemGreen
-        }
     }
     
-    // MARK: - Header
     private func createHeaderView() -> NSView {
-        let container = FlippedView()
-        container.translatesAutoresizingMaskIntoConstraints = false
+        let view = NSView()
+        view.translatesAutoresizingMaskIntoConstraints = false
         
-        let iconBg = NSView()
-        iconBg.wantsLayer = true
-        iconBg.layer?.backgroundColor = NSColor.systemPurple.withAlphaComponent(0.25).cgColor
-        iconBg.layer?.cornerRadius = 12
-        iconBg.layer?.borderColor = NSColor.systemPurple.withAlphaComponent(0.6).cgColor
-        iconBg.layer?.borderWidth = 1
-        iconBg.translatesAutoresizingMaskIntoConstraints = false
-        
-        let iconView = NSImageView(image: NSImage(systemSymbolName: "syringe.fill", accessibilityDescription: nil)!)
-        iconView.contentTintColor = .systemPurple
-        iconView.translatesAutoresizingMaskIntoConstraints = false
-        iconBg.addSubview(iconView)
-        
-        let titleLabel = NSTextField(labelWithString: "Darwin Mach-O Dynamic Library Injector")
+        let titleLabel = NSTextField(labelWithString: "Mach-O Dynamic Library Injector")
         titleLabel.font = .systemFont(ofSize: 18, weight: .bold)
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
         
-        let subtitleLabel = NSTextField(labelWithString: "Position-independent Darwin code injection with ARM64 & x86_64 remote execution.")
-        subtitleLabel.font = .systemFont(ofSize: 12)
-        subtitleLabel.textColor = .secondaryLabelColor
-        subtitleLabel.translatesAutoresizingMaskIntoConstraints = false
+        let subLabel = NSTextField(labelWithString: "Inject native dynamic libraries into remote Mach memory spaces with position-independent stubs and W^X memory enforcement.")
+        subLabel.font = .systemFont(ofSize: 12)
+        subLabel.textColor = .secondaryLabelColor
+        subLabel.translatesAutoresizingMaskIntoConstraints = false
         
-        container.addSubview(iconBg)
-        container.addSubview(titleLabel)
-        container.addSubview(subtitleLabel)
+        view.addSubview(titleLabel)
+        view.addSubview(subLabel)
         
         NSLayoutConstraint.activate([
-            iconBg.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            iconBg.centerYAnchor.constraint(equalTo: container.centerYAnchor),
-            iconBg.widthAnchor.constraint(equalToConstant: 44),
-            iconBg.heightAnchor.constraint(equalToConstant: 44),
+            titleLabel.topAnchor.constraint(equalTo: view.topAnchor),
+            titleLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             
-            iconView.centerXAnchor.constraint(equalTo: iconBg.centerXAnchor),
-            iconView.centerYAnchor.constraint(equalTo: iconBg.centerYAnchor),
-            iconView.widthAnchor.constraint(equalToConstant: 24),
-            iconView.heightAnchor.constraint(equalToConstant: 24),
-            
-            titleLabel.topAnchor.constraint(equalTo: container.topAnchor),
-            titleLabel.leadingAnchor.constraint(equalTo: iconBg.trailingAnchor, constant: 14),
-            titleLabel.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            
-            subtitleLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 4),
-            subtitleLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
-            subtitleLabel.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            subtitleLabel.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+            subLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 2),
+            subLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            subLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            subLabel.bottomAnchor.constraint(equalTo: view.bottomAnchor)
         ])
         
-        return container
+        return view
     }
     
-    // MARK: - Card 1: Process
-    private func createProcessCard() -> CardView {
-        let card = CardView(title: "1. Target Process Selection", icon: "cpu")
+    private func createProcessCard() -> NSView {
+        let group = GroupSectionView(title: "1. Target Process Configuration", subtitle: "Select a running process by name or PID", iconName: "scope")
         
-        let nameLbl = NSTextField(labelWithString: "Process Name:")
-        nameLbl.font = .systemFont(ofSize: 12)
-        nameLbl.translatesAutoresizingMaskIntoConstraints = false
-        card.addSubview(nameLbl)
+        targetModeSegmented.selectedSegment = 0
+        targetModeSegmented.target = self
+        targetModeSegmented.action = #selector(handleTargetModeChanged)
+        targetModeSegmented.translatesAutoresizingMaskIntoConstraints = false
+        group.contentView.addSubview(targetModeSegmented)
         
-        processNameField.placeholderString = "e.g. RobloxPlayer"
+        processNameField.placeholderString = "Process Name (e.g. RobloxPlayer, Finder, Safari)"
+        processNameField.stringValue = "RobloxPlayer"
+        processNameField.font = .systemFont(ofSize: 12)
+        processNameField.target = self
+        processNameField.action = #selector(handleTargetTextChanged)
         processNameField.translatesAutoresizingMaskIntoConstraints = false
-        card.addSubview(processNameField)
+        group.contentView.addSubview(processNameField)
         
-        let pidLbl = NSTextField(labelWithString: "Or Target PID:")
-        pidLbl.font = .systemFont(ofSize: 12)
-        pidLbl.translatesAutoresizingMaskIntoConstraints = false
-        card.addSubview(pidLbl)
-        
-        pidField.placeholderString = "e.g. 1234"
+        pidField.placeholderString = "Target PID (e.g. 1234)"
+        pidField.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        pidField.target = self
+        pidField.action = #selector(handleTargetTextChanged)
+        pidField.isHidden = true
         pidField.translatesAutoresizingMaskIntoConstraints = false
-        card.addSubview(pidField)
+        group.contentView.addSubview(pidField)
         
-        let browseBtn = NSButton(title: "Browse Processes...", target: self, action: #selector(handleBrowseProcesses))
-        browseBtn.bezelStyle = .rounded
-        browseBtn.translatesAutoresizingMaskIntoConstraints = false
-        card.addSubview(browseBtn)
+        browseProcessesButton.title = "Browse Processes..."
+        browseProcessesButton.image = NSImage(systemSymbolName: "cpu", accessibilityDescription: nil)
+        browseProcessesButton.bezelStyle = .rounded
+        browseProcessesButton.target = self
+        browseProcessesButton.action = #selector(handleBrowseProcesses)
+        browseProcessesButton.translatesAutoresizingMaskIntoConstraints = false
+        group.contentView.addSubview(browseProcessesButton)
         
-        let presetLbl = NSTextField(labelWithString: "Quick Presets:")
-        presetLbl.font = .systemFont(ofSize: 11)
-        presetLbl.textColor = .secondaryLabelColor
-        presetLbl.translatesAutoresizingMaskIntoConstraints = false
-        card.addSubview(presetLbl)
+        // Target Preview Box
+        targetPreviewBox.boxType = .custom
+        targetPreviewBox.borderWidth = 1
+        targetPreviewBox.borderColor = NSColor.separatorColor.withAlphaComponent(0.3)
+        targetPreviewBox.cornerRadius = 8
+        targetPreviewBox.fillColor = NSColor.controlBackgroundColor.withAlphaComponent(0.3)
+        targetPreviewBox.translatesAutoresizingMaskIntoConstraints = false
+        group.contentView.addSubview(targetPreviewBox)
         
-        let robloxBtn = NSButton(title: "RobloxPlayer", target: self, action: #selector(setPresetRoblox))
-        robloxBtn.bezelStyle = .inline
-        robloxBtn.translatesAutoresizingMaskIntoConstraints = false
-        card.addSubview(robloxBtn)
+        targetIconView.image = NSImage(systemSymbolName: "cpu", accessibilityDescription: nil)
+        targetIconView.contentTintColor = .controlAccentColor
+        targetIconView.translatesAutoresizingMaskIntoConstraints = false
+        targetPreviewBox.addSubview(targetIconView)
         
-        let finderBtn = NSButton(title: "Finder", target: self, action: #selector(setPresetFinder))
-        finderBtn.bezelStyle = .inline
-        finderBtn.translatesAutoresizingMaskIntoConstraints = false
-        card.addSubview(finderBtn)
+        targetTitleLabel.font = .systemFont(ofSize: 12, weight: .semibold)
+        targetTitleLabel.translatesAutoresizingMaskIntoConstraints = false
+        targetPreviewBox.addSubview(targetTitleLabel)
         
-        targetInfoLabel.font = .systemFont(ofSize: 11, weight: .medium)
-        targetInfoLabel.textColor = .secondaryLabelColor
-        targetInfoLabel.translatesAutoresizingMaskIntoConstraints = false
-        card.addSubview(targetInfoLabel)
+        targetSubtitleLabel.font = .systemFont(ofSize: 11, weight: .regular)
+        targetSubtitleLabel.textColor = .secondaryLabelColor
+        targetSubtitleLabel.translatesAutoresizingMaskIntoConstraints = false
+        targetPreviewBox.addSubview(targetSubtitleLabel)
+        
+        targetPreviewBox.addSubview(targetArchPill)
+        targetPreviewBox.addSubview(targetSecPill)
         
         NSLayoutConstraint.activate([
-            nameLbl.topAnchor.constraint(equalTo: card.contentTopAnchor, constant: 12),
-            nameLbl.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 16),
+            targetModeSegmented.topAnchor.constraint(equalTo: group.contentView.topAnchor),
+            targetModeSegmented.leadingAnchor.constraint(equalTo: group.contentView.leadingAnchor),
             
-            processNameField.topAnchor.constraint(equalTo: nameLbl.bottomAnchor, constant: 4),
-            processNameField.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 16),
-            processNameField.widthAnchor.constraint(equalToConstant: 240),
+            processNameField.topAnchor.constraint(equalTo: targetModeSegmented.bottomAnchor, constant: 10),
+            processNameField.leadingAnchor.constraint(equalTo: group.contentView.leadingAnchor),
+            processNameField.trailingAnchor.constraint(equalTo: browseProcessesButton.leadingAnchor, constant: -10),
             
-            pidLbl.topAnchor.constraint(equalTo: nameLbl.topAnchor),
-            pidLbl.leadingAnchor.constraint(equalTo: processNameField.trailingAnchor, constant: 16),
+            pidField.topAnchor.constraint(equalTo: targetModeSegmented.bottomAnchor, constant: 10),
+            pidField.leadingAnchor.constraint(equalTo: group.contentView.leadingAnchor),
+            pidField.trailingAnchor.constraint(equalTo: browseProcessesButton.leadingAnchor, constant: -10),
             
-            pidField.topAnchor.constraint(equalTo: processNameField.topAnchor),
-            pidField.leadingAnchor.constraint(equalTo: pidLbl.leadingAnchor),
-            pidField.widthAnchor.constraint(equalToConstant: 110),
+            browseProcessesButton.centerYAnchor.constraint(equalTo: processNameField.centerYAnchor),
+            browseProcessesButton.trailingAnchor.constraint(equalTo: group.contentView.trailingAnchor),
             
-            browseBtn.centerYAnchor.constraint(equalTo: processNameField.centerYAnchor),
-            browseBtn.leadingAnchor.constraint(equalTo: pidField.trailingAnchor, constant: 16),
+            targetPreviewBox.topAnchor.constraint(equalTo: processNameField.bottomAnchor, constant: 10),
+            targetPreviewBox.leadingAnchor.constraint(equalTo: group.contentView.leadingAnchor),
+            targetPreviewBox.trailingAnchor.constraint(equalTo: group.contentView.trailingAnchor),
+            targetPreviewBox.bottomAnchor.constraint(equalTo: group.contentView.bottomAnchor),
+            targetPreviewBox.heightAnchor.constraint(equalToConstant: 44),
             
-            presetLbl.topAnchor.constraint(equalTo: processNameField.bottomAnchor, constant: 12),
-            presetLbl.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 16),
+            targetIconView.leadingAnchor.constraint(equalTo: targetPreviewBox.leadingAnchor, constant: 12),
+            targetIconView.centerYAnchor.constraint(equalTo: targetPreviewBox.centerYAnchor),
+            targetIconView.widthAnchor.constraint(equalToConstant: 22),
+            targetIconView.heightAnchor.constraint(equalToConstant: 22),
             
-            robloxBtn.centerYAnchor.constraint(equalTo: presetLbl.centerYAnchor),
-            robloxBtn.leadingAnchor.constraint(equalTo: presetLbl.trailingAnchor, constant: 8),
+            targetTitleLabel.topAnchor.constraint(equalTo: targetPreviewBox.topAnchor, constant: 6),
+            targetTitleLabel.leadingAnchor.constraint(equalTo: targetIconView.trailingAnchor, constant: 10),
             
-            finderBtn.centerYAnchor.constraint(equalTo: presetLbl.centerYAnchor),
-            finderBtn.leadingAnchor.constraint(equalTo: robloxBtn.trailingAnchor, constant: 8),
+            targetSubtitleLabel.topAnchor.constraint(equalTo: targetTitleLabel.bottomAnchor, constant: 1),
+            targetSubtitleLabel.leadingAnchor.constraint(equalTo: targetTitleLabel.leadingAnchor),
             
-            targetInfoLabel.topAnchor.constraint(equalTo: presetLbl.bottomAnchor, constant: 10),
-            targetInfoLabel.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 16),
-            targetInfoLabel.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -16),
-            card.bottomAnchor.constraint(equalTo: targetInfoLabel.bottomAnchor, constant: 14)
+            targetSecPill.trailingAnchor.constraint(equalTo: targetPreviewBox.trailingAnchor, constant: -12),
+            targetSecPill.centerYAnchor.constraint(equalTo: targetPreviewBox.centerYAnchor),
+            
+            targetArchPill.trailingAnchor.constraint(equalTo: targetSecPill.leadingAnchor, constant: -6),
+            targetArchPill.centerYAnchor.constraint(equalTo: targetPreviewBox.centerYAnchor)
         ])
         
-        return card
+        return group
     }
     
-    // MARK: - Card 2: Dylib
-    private func createDylibCard() -> CardView {
-        let card = CardView(title: "2. Payload Dynamic Library (.dylib)", icon: "doc.badge.gearshape")
+    private func createDylibCard() -> NSView {
+        let group = GroupSectionView(title: "2. Dynamic Library Payload (.dylib)", subtitle: "Path to Mach-O payload with live binary inspector", iconName: "shippingbox")
         
-        dylibPathField.placeholderString = "Path to dynamic library (.dylib)"
+        dylibPathField.placeholderString = "Path to dynamic library (.dylib)..."
         dylibPathField.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        dylibPathField.target = self
+        dylibPathField.action = #selector(handleDylibPathChanged)
         dylibPathField.translatesAutoresizingMaskIntoConstraints = false
-        card.addSubview(dylibPathField)
+        group.contentView.addSubview(dylibPathField)
         
-        let browseBtn = NSButton(title: "Browse...", target: self, action: #selector(handleBrowseDylib))
-        browseBtn.bezelStyle = .rounded
-        browseBtn.translatesAutoresizingMaskIntoConstraints = false
-        card.addSubview(browseBtn)
+        browseDylibButton.title = "Browse..."
+        browseDylibButton.image = NSImage(systemSymbolName: "folder", accessibilityDescription: nil)
+        browseDylibButton.bezelStyle = .rounded
+        browseDylibButton.target = self
+        browseDylibButton.action = #selector(handleBrowseDylib)
+        browseDylibButton.translatesAutoresizingMaskIntoConstraints = false
+        group.contentView.addSubview(browseDylibButton)
         
-        let bundledBtn = NSButton(title: "Use Bundled Payload", target: self, action: #selector(handleUseBundledDylib))
-        bundledBtn.bezelStyle = .rounded
-        bundledBtn.translatesAutoresizingMaskIntoConstraints = false
-        card.addSubview(bundledBtn)
+        useBundledButton.title = "Use Bundled Payload"
+        useBundledButton.image = NSImage(systemSymbolName: "bolt.fill", accessibilityDescription: nil)
+        useBundledButton.bezelStyle = .rounded
+        useBundledButton.target = self
+        useBundledButton.action = #selector(handleUseBundledPayload)
+        useBundledButton.translatesAutoresizingMaskIntoConstraints = false
+        group.contentView.addSubview(useBundledButton)
         
-        dylibStatusLabel.font = .systemFont(ofSize: 11)
-        dylibStatusLabel.translatesAutoresizingMaskIntoConstraints = false
-        card.addSubview(dylibStatusLabel)
+        // Embedded Live Mach-O Inspector Panel
+        inspectorGroup.translatesAutoresizingMaskIntoConstraints = false
+        group.contentView.addSubview(inspectorGroup)
+        
+        dylibNameLabel.font = .systemFont(ofSize: 12, weight: .semibold)
+        dylibNameLabel.translatesAutoresizingMaskIntoConstraints = false
+        inspectorGroup.contentView.addSubview(dylibNameLabel)
+        
+        dylibCompatBadge.translatesAutoresizingMaskIntoConstraints = false
+        inspectorGroup.contentView.addSubview(dylibCompatBadge)
+        
+        dylibArchSlicesLabel.font = .systemFont(ofSize: 11, weight: .regular)
+        dylibArchSlicesLabel.textColor = .secondaryLabelColor
+        dylibArchSlicesLabel.translatesAutoresizingMaskIntoConstraints = false
+        inspectorGroup.contentView.addSubview(dylibArchSlicesLabel)
+        
+        dylibInstallNameLabel.font = .systemFont(ofSize: 11, weight: .regular)
+        dylibInstallNameLabel.textColor = .secondaryLabelColor
+        dylibInstallNameLabel.lineBreakMode = .byTruncatingMiddle
+        dylibInstallNameLabel.translatesAutoresizingMaskIntoConstraints = false
+        inspectorGroup.contentView.addSubview(dylibInstallNameLabel)
+        
+        dylibDepsLabel.font = .systemFont(ofSize: 11, weight: .regular)
+        dylibDepsLabel.textColor = .secondaryLabelColor
+        dylibDepsLabel.translatesAutoresizingMaskIntoConstraints = false
+        inspectorGroup.contentView.addSubview(dylibDepsLabel)
+        
+        dylibSignatureLabel.font = .systemFont(ofSize: 11, weight: .regular)
+        dylibSignatureLabel.textColor = .secondaryLabelColor
+        dylibSignatureLabel.translatesAutoresizingMaskIntoConstraints = false
+        inspectorGroup.contentView.addSubview(dylibSignatureLabel)
         
         NSLayoutConstraint.activate([
-            dylibPathField.topAnchor.constraint(equalTo: card.contentTopAnchor, constant: 12),
-            dylibPathField.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 16),
-            dylibPathField.trailingAnchor.constraint(equalTo: browseBtn.leadingAnchor, constant: -10),
+            dylibPathField.topAnchor.constraint(equalTo: group.contentView.topAnchor),
+            dylibPathField.leadingAnchor.constraint(equalTo: group.contentView.leadingAnchor),
+            dylibPathField.trailingAnchor.constraint(equalTo: browseDylibButton.leadingAnchor, constant: -8),
             
-            browseBtn.centerYAnchor.constraint(equalTo: dylibPathField.centerYAnchor),
-            browseBtn.trailingAnchor.constraint(equalTo: bundledBtn.leadingAnchor, constant: -8),
+            browseDylibButton.centerYAnchor.constraint(equalTo: dylibPathField.centerYAnchor),
+            browseDylibButton.trailingAnchor.constraint(equalTo: useBundledButton.leadingAnchor, constant: -8),
             
-            bundledBtn.centerYAnchor.constraint(equalTo: dylibPathField.centerYAnchor),
-            bundledBtn.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -16),
+            useBundledButton.centerYAnchor.constraint(equalTo: dylibPathField.centerYAnchor),
+            useBundledButton.trailingAnchor.constraint(equalTo: group.contentView.trailingAnchor),
             
-            dylibStatusLabel.topAnchor.constraint(equalTo: dylibPathField.bottomAnchor, constant: 8),
-            dylibStatusLabel.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 16),
-            dylibStatusLabel.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -16),
-            card.bottomAnchor.constraint(equalTo: dylibStatusLabel.bottomAnchor, constant: 14)
+            inspectorGroup.topAnchor.constraint(equalTo: dylibPathField.bottomAnchor, constant: 10),
+            inspectorGroup.leadingAnchor.constraint(equalTo: group.contentView.leadingAnchor),
+            inspectorGroup.trailingAnchor.constraint(equalTo: group.contentView.trailingAnchor),
+            inspectorGroup.bottomAnchor.constraint(equalTo: group.contentView.bottomAnchor),
+            
+            dylibNameLabel.topAnchor.constraint(equalTo: inspectorGroup.contentView.topAnchor),
+            dylibNameLabel.leadingAnchor.constraint(equalTo: inspectorGroup.contentView.leadingAnchor),
+            
+            dylibCompatBadge.centerYAnchor.constraint(equalTo: dylibNameLabel.centerYAnchor),
+            dylibCompatBadge.trailingAnchor.constraint(equalTo: inspectorGroup.contentView.trailingAnchor),
+            
+            dylibArchSlicesLabel.topAnchor.constraint(equalTo: dylibNameLabel.bottomAnchor, constant: 4),
+            dylibArchSlicesLabel.leadingAnchor.constraint(equalTo: inspectorGroup.contentView.leadingAnchor),
+            
+            dylibInstallNameLabel.topAnchor.constraint(equalTo: dylibArchSlicesLabel.bottomAnchor, constant: 3),
+            dylibInstallNameLabel.leadingAnchor.constraint(equalTo: inspectorGroup.contentView.leadingAnchor),
+            dylibInstallNameLabel.trailingAnchor.constraint(equalTo: inspectorGroup.contentView.trailingAnchor),
+            
+            dylibDepsLabel.topAnchor.constraint(equalTo: dylibInstallNameLabel.bottomAnchor, constant: 3),
+            dylibDepsLabel.leadingAnchor.constraint(equalTo: inspectorGroup.contentView.leadingAnchor),
+            
+            dylibSignatureLabel.topAnchor.constraint(equalTo: dylibDepsLabel.bottomAnchor, constant: 3),
+            dylibSignatureLabel.leadingAnchor.constraint(equalTo: inspectorGroup.contentView.leadingAnchor),
+            dylibSignatureLabel.bottomAnchor.constraint(equalTo: inspectorGroup.contentView.bottomAnchor)
         ])
         
-        return card
+        return group
     }
     
-    // MARK: - Card 3: Options
-    private func createOptionsCard() -> CardView {
-        let card = CardView(title: "3. Injection Options & Privileges", icon: "slider.horizontal.3")
+    private func createOptionsCard() -> NSView {
+        let group = GroupSectionView(title: "3. Injection Options & Pre-Flight Check", subtitle: "Configure dlopen mode, timeouts, and elevation", iconName: "slider.horizontal.3")
         
-        let modeLbl = NSTextField(labelWithString: "dlopen Loading Mode:")
-        modeLbl.font = .systemFont(ofSize: 12)
-        modeLbl.translatesAutoresizingMaskIntoConstraints = false
-        card.addSubview(modeLbl)
+        let modeLabel = NSTextField(labelWithString: "dlopen() Mode:")
+        modeLabel.font = .systemFont(ofSize: 12)
+        modeLabel.translatesAutoresizingMaskIntoConstraints = false
+        group.contentView.addSubview(modeLabel)
         
-        modePopup.addItems(withTitles: ["RTLD_NOW (Immediate)", "RTLD_LAZY (Deferred)"])
+        modePopup.addItems(withTitles: ["RTLD_NOW (Immediate Symbol Binding)", "RTLD_LAZY (Deferred Binding)"])
+        modePopup.selectItem(at: 0)
         modePopup.translatesAutoresizingMaskIntoConstraints = false
-        card.addSubview(modePopup)
+        group.contentView.addSubview(modePopup)
         
-        let timeoutTitleLbl = NSTextField(labelWithString: "Wait Timeout:")
-        timeoutTitleLbl.font = .systemFont(ofSize: 12)
-        timeoutTitleLbl.translatesAutoresizingMaskIntoConstraints = false
-        card.addSubview(timeoutTitleLbl)
+        let timeoutTitle = NSTextField(labelWithString: "Timeout:")
+        timeoutTitle.font = .systemFont(ofSize: 12)
+        timeoutTitle.translatesAutoresizingMaskIntoConstraints = false
+        group.contentView.addSubview(timeoutTitle)
         
         timeoutSlider.minValue = 500
         timeoutSlider.maxValue = 10000
@@ -334,97 +445,106 @@ public final class InjectorViewController: NSViewController {
         timeoutSlider.target = self
         timeoutSlider.action = #selector(handleTimeoutChanged)
         timeoutSlider.translatesAutoresizingMaskIntoConstraints = false
-        card.addSubview(timeoutSlider)
+        group.contentView.addSubview(timeoutSlider)
         
-        timeoutLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        timeoutLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        timeoutLabel.textColor = .secondaryLabelColor
         timeoutLabel.translatesAutoresizingMaskIntoConstraints = false
-        card.addSubview(timeoutLabel)
+        group.contentView.addSubview(timeoutLabel)
         
         waitCompletionCheckbox.state = .on
         waitCompletionCheckbox.translatesAutoresizingMaskIntoConstraints = false
-        card.addSubview(waitCompletionCheckbox)
+        group.contentView.addSubview(waitCompletionCheckbox)
         
         verboseCheckbox.state = .on
         verboseCheckbox.translatesAutoresizingMaskIntoConstraints = false
-        card.addSubview(verboseCheckbox)
+        group.contentView.addSubview(verboseCheckbox)
         
         adminCheckbox.state = .on
-        adminCheckbox.font = .systemFont(ofSize: 13, weight: .medium)
         adminCheckbox.translatesAutoresizingMaskIntoConstraints = false
-        card.addSubview(adminCheckbox)
+        group.contentView.addSubview(adminCheckbox)
         
-        let adminHint = NSTextField(labelWithString: "Prompts for standard macOS admin authorization (required for task_for_pid on Darwin).")
-        adminHint.font = .systemFont(ofSize: 10)
-        adminHint.textColor = .secondaryLabelColor
-        adminHint.translatesAutoresizingMaskIntoConstraints = false
-        card.addSubview(adminHint)
+        // Preflight Box
+        preflightBox.boxType = .custom
+        preflightBox.borderWidth = 1
+        preflightBox.cornerRadius = 8
+        preflightBox.fillColor = NSColor.controlBackgroundColor.withAlphaComponent(0.3)
+        preflightBox.borderColor = NSColor.separatorColor.withAlphaComponent(0.3)
+        preflightBox.translatesAutoresizingMaskIntoConstraints = false
+        group.contentView.addSubview(preflightBox)
+        
+        preflightLabel.font = .systemFont(ofSize: 11, weight: .medium)
+        preflightLabel.textColor = .secondaryLabelColor
+        preflightLabel.lineBreakMode = .byWordWrapping
+        preflightLabel.translatesAutoresizingMaskIntoConstraints = false
+        preflightBox.addSubview(preflightLabel)
         
         NSLayoutConstraint.activate([
-            modeLbl.topAnchor.constraint(equalTo: card.contentTopAnchor, constant: 12),
-            modeLbl.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 16),
+            modeLabel.topAnchor.constraint(equalTo: group.contentView.topAnchor),
+            modeLabel.leadingAnchor.constraint(equalTo: group.contentView.leadingAnchor),
             
-            modePopup.centerYAnchor.constraint(equalTo: modeLbl.centerYAnchor),
-            modePopup.leadingAnchor.constraint(equalTo: modeLbl.trailingAnchor, constant: 12),
-            modePopup.widthAnchor.constraint(equalToConstant: 210),
+            modePopup.centerYAnchor.constraint(equalTo: modeLabel.centerYAnchor),
+            modePopup.leadingAnchor.constraint(equalTo: modeLabel.trailingAnchor, constant: 10),
             
-            timeoutTitleLbl.topAnchor.constraint(equalTo: modeLbl.bottomAnchor, constant: 12),
-            timeoutTitleLbl.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 16),
+            timeoutTitle.centerYAnchor.constraint(equalTo: modeLabel.centerYAnchor),
+            timeoutTitle.leadingAnchor.constraint(equalTo: modePopup.trailingAnchor, constant: 24),
             
-            timeoutSlider.centerYAnchor.constraint(equalTo: timeoutTitleLbl.centerYAnchor),
-            timeoutSlider.leadingAnchor.constraint(equalTo: modePopup.leadingAnchor),
-            timeoutSlider.widthAnchor.constraint(equalToConstant: 210),
+            timeoutSlider.centerYAnchor.constraint(equalTo: modeLabel.centerYAnchor),
+            timeoutSlider.leadingAnchor.constraint(equalTo: timeoutTitle.trailingAnchor, constant: 8),
+            timeoutSlider.widthAnchor.constraint(equalToConstant: 120),
             
-            timeoutLabel.centerYAnchor.constraint(equalTo: timeoutSlider.centerYAnchor),
-            timeoutLabel.leadingAnchor.constraint(equalTo: timeoutSlider.trailingAnchor, constant: 10),
+            timeoutLabel.centerYAnchor.constraint(equalTo: modeLabel.centerYAnchor),
+            timeoutLabel.leadingAnchor.constraint(equalTo: timeoutSlider.trailingAnchor, constant: 8),
             
-            waitCompletionCheckbox.topAnchor.constraint(equalTo: timeoutTitleLbl.bottomAnchor, constant: 12),
-            waitCompletionCheckbox.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 16),
+            waitCompletionCheckbox.topAnchor.constraint(equalTo: modeLabel.bottomAnchor, constant: 12),
+            waitCompletionCheckbox.leadingAnchor.constraint(equalTo: group.contentView.leadingAnchor),
             
             verboseCheckbox.topAnchor.constraint(equalTo: waitCompletionCheckbox.bottomAnchor, constant: 8),
-            verboseCheckbox.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 16),
+            verboseCheckbox.leadingAnchor.constraint(equalTo: group.contentView.leadingAnchor),
             
-            adminCheckbox.topAnchor.constraint(equalTo: verboseCheckbox.bottomAnchor, constant: 10),
-            adminCheckbox.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 16),
+            adminCheckbox.topAnchor.constraint(equalTo: verboseCheckbox.bottomAnchor, constant: 8),
+            adminCheckbox.leadingAnchor.constraint(equalTo: group.contentView.leadingAnchor),
             
-            adminHint.topAnchor.constraint(equalTo: adminCheckbox.bottomAnchor, constant: 2),
-            adminHint.leadingAnchor.constraint(equalTo: adminCheckbox.leadingAnchor, constant: 20),
-            adminHint.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -16),
-            card.bottomAnchor.constraint(equalTo: adminHint.bottomAnchor, constant: 14)
+            preflightBox.topAnchor.constraint(equalTo: adminCheckbox.bottomAnchor, constant: 10),
+            preflightBox.leadingAnchor.constraint(equalTo: group.contentView.leadingAnchor),
+            preflightBox.trailingAnchor.constraint(equalTo: group.contentView.trailingAnchor),
+            preflightBox.bottomAnchor.constraint(equalTo: group.contentView.bottomAnchor),
+            
+            preflightLabel.topAnchor.constraint(equalTo: preflightBox.topAnchor, constant: 8),
+            preflightLabel.leadingAnchor.constraint(equalTo: preflightBox.leadingAnchor, constant: 10),
+            preflightLabel.trailingAnchor.constraint(equalTo: preflightBox.trailingAnchor, constant: -10),
+            preflightLabel.bottomAnchor.constraint(equalTo: preflightBox.bottomAnchor, constant: -8)
         ])
         
-        return card
+        return group
     }
     
-    // MARK: - Action Section
     private func createActionView() -> NSView {
-        let container = FlippedView()
-        container.translatesAutoresizingMaskIntoConstraints = false
+        let view = NSView()
+        view.translatesAutoresizingMaskIntoConstraints = false
         
-        injectButton.title = "Inject Dynamic Library"
-        injectButton.image = NSImage(systemSymbolName: "bolt.fill", accessibilityDescription: nil)
-        injectButton.imagePosition = .imageLeading
-        injectButton.imageHugsTitle = true
-        injectButton.bezelStyle = .regularSquare
-        injectButton.isBordered = false
-        injectButton.wantsLayer = true
-        injectButton.layer?.backgroundColor = NSColor.systemPurple.cgColor
-        injectButton.layer?.cornerRadius = 8
-        injectButton.contentTintColor = .white
-        injectButton.font = .systemFont(ofSize: 14, weight: .bold)
+        injectButton.title = "  Inject Dynamic Library"
+        injectButton.image = NSImage(systemSymbolName: "syringe.fill", accessibilityDescription: nil)
+        injectButton.bezelStyle = .rounded
+        injectButton.contentTintColor = .controlAccentColor
+        injectButton.font = .systemFont(ofSize: 13, weight: .bold)
         injectButton.target = self
         injectButton.action = #selector(handleInject)
         injectButton.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(injectButton)
         
         progressIndicator.style = .spinning
-        progressIndicator.isDisplayedWhenStopped = false
         progressIndicator.controlSize = .small
+        progressIndicator.isDisplayedWhenStopped = false
         progressIndicator.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(progressIndicator)
         
         resultBox.boxType = .custom
         resultBox.borderWidth = 1
         resultBox.cornerRadius = 8
         resultBox.isHidden = true
         resultBox.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(resultBox)
         
         resultLabel.font = .systemFont(ofSize: 12, weight: .medium)
         resultLabel.lineBreakMode = .byWordWrapping
@@ -432,131 +552,203 @@ public final class InjectorViewController: NSViewController {
         resultBox.addSubview(resultLabel)
         
         NSLayoutConstraint.activate([
+            injectButton.topAnchor.constraint(equalTo: view.topAnchor),
+            injectButton.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            injectButton.heightAnchor.constraint(equalToConstant: 34),
+            injectButton.widthAnchor.constraint(equalToConstant: 240),
+            
+            progressIndicator.centerYAnchor.constraint(equalTo: injectButton.centerYAnchor),
+            progressIndicator.leadingAnchor.constraint(equalTo: injectButton.trailingAnchor, constant: 12),
+            
+            resultBox.topAnchor.constraint(equalTo: injectButton.bottomAnchor, constant: 12),
+            resultBox.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            resultBox.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            resultBox.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            
             resultLabel.topAnchor.constraint(equalTo: resultBox.topAnchor, constant: 10),
-            resultLabel.leadingAnchor.constraint(equalTo: resultBox.leadingAnchor, constant: 12),
-            resultLabel.trailingAnchor.constraint(equalTo: resultBox.trailingAnchor, constant: -12),
+            resultLabel.leadingAnchor.constraint(equalTo: resultBox.leadingAnchor, constant: 14),
+            resultLabel.trailingAnchor.constraint(equalTo: resultBox.trailingAnchor, constant: -14),
             resultLabel.bottomAnchor.constraint(equalTo: resultBox.bottomAnchor, constant: -10)
         ])
         
-        container.addSubview(injectButton)
-        container.addSubview(progressIndicator)
-        container.addSubview(resultBox)
+        return view
+    }
+    
+    private func bindViewModel() {
+        injectorService.$isInjecting
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] isInjecting in
+                self?.injectButton.isEnabled = !isInjecting
+                if isInjecting {
+                    self?.progressIndicator.startAnimation(nil)
+                } else {
+                    self?.progressIndicator.stopAnimation(nil)
+                }
+            }
+            .store(in: &cancellables)
         
-        NSLayoutConstraint.activate([
-            injectButton.topAnchor.constraint(equalTo: container.topAnchor),
-            injectButton.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            injectButton.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            injectButton.heightAnchor.constraint(equalToConstant: 44),
-            
-            progressIndicator.centerYAnchor.constraint(equalTo: injectButton.centerYAnchor),
-            progressIndicator.trailingAnchor.constraint(equalTo: injectButton.trailingAnchor, constant: -16),
-            
-            resultBox.topAnchor.constraint(equalTo: injectButton.bottomAnchor, constant: 10),
-            resultBox.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            resultBox.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            container.bottomAnchor.constraint(equalTo: resultBox.bottomAnchor)
-        ])
+        injectorService.$lastResult
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] res in
+                guard let self = self else { return }
+                if let msg = res {
+                    self.resultBox.isHidden = false
+                    self.resultLabel.stringValue = msg
+                    let isSuccess = self.injectorService.lastSuccess ?? false
+                    if isSuccess {
+                        self.resultBox.fillColor = NSColor.systemGreen.withAlphaComponent(0.12)
+                        self.resultBox.borderColor = NSColor.systemGreen.withAlphaComponent(0.4)
+                        self.resultLabel.textColor = .systemGreen
+                    } else {
+                        self.resultBox.fillColor = NSColor.systemRed.withAlphaComponent(0.12)
+                        self.resultBox.borderColor = NSColor.systemRed.withAlphaComponent(0.4)
+                        self.resultLabel.textColor = .systemRed
+                    }
+                } else {
+                    self.resultBox.isHidden = true
+                }
+            }
+            .store(in: &cancellables)
+    }
+    
+    private func loadDefaultPayload() {
+        if let defaultDylib = injectorService.resolveDefaultDylib() {
+            dylibPathField.stringValue = defaultDylib
+            inspectDylib(atPath: defaultDylib)
+        }
+    }
+    
+    private func inspectDylib(atPath path: String) {
+        let expanded = (path as NSString).expandingTildeInPath
+        let url = URL(fileURLWithPath: expanded)
         
-        return container
+        guard let info = MachOInspector.inspect(url: url) else {
+            dylibNameLabel.stringValue = url.lastPathComponent
+            dylibCompatBadge.update(text: "Invalid Mach-O", color: .systemRed)
+            dylibArchSlicesLabel.stringValue = "Slices: Unknown or damaged binary"
+            dylibInstallNameLabel.stringValue = "Install Name: -"
+            dylibDepsLabel.stringValue = "Dependencies: -"
+            dylibSignatureLabel.stringValue = "Signature: -"
+            currentInspection = nil
+            return
+        }
+        
+        currentInspection = info
+        dylibNameLabel.stringValue = "\(info.fileName) (\(info.formattedSize))"
+        
+        let sliceStrings = info.slices.map { $0.arch.rawValue.uppercased() }.joined(separator: ", ")
+        dylibArchSlicesLabel.stringValue = "Mach-O Slices: [\(sliceStrings)]"
+        dylibInstallNameLabel.stringValue = "Install Name: \(info.installName) (v\(info.currentVersion))"
+        dylibDepsLabel.stringValue = "Dependencies (\(info.dependencies.count)): \(info.dependencies.prefix(2).joined(separator: ", "))\(info.dependencies.count > 2 ? "..." : "")"
+        
+        let sigText: String
+        if info.isSigned {
+            if let team = info.teamIdentifier {
+                sigText = "Signed (Team ID: \(team))"
+            } else if info.isAdHoc {
+                sigText = "Ad-Hoc Signed"
+            } else {
+                sigText = "Cryptographically Signed"
+            }
+        } else {
+            sigText = "Unsigned"
+        }
+        dylibSignatureLabel.stringValue = "Code Signature: \(sigText)"
+        
+        revalidateCompatibility()
+    }
+    
+    private func revalidateCompatibility() {
+        guard let info = currentInspection else {
+            dylibCompatBadge.update(text: "No Payload", color: .secondaryLabelColor)
+            return
+        }
+        
+        let isCompat = info.isCompatible(with: currentTargetArch)
+        if isCompat {
+            dylibCompatBadge.update(text: "✓ Compatible (\(currentTargetArch.rawValue.uppercased()))", color: .systemGreen)
+        } else {
+            dylibCompatBadge.update(text: "✕ Arch Mismatch", color: .systemRed)
+        }
     }
     
     // MARK: - Actions
+    
+    @objc private func handleTargetModeChanged() {
+        let isPid = (targetModeSegmented.selectedSegment == 1)
+        processNameField.isHidden = isPid
+        pidField.isHidden = !isPid
+    }
+    
+    @objc private func handleTargetTextChanged() {
+        if targetModeSegmented.selectedSegment == 0 {
+            let name = processNameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            targetTitleLabel.stringValue = "Target: \(name)"
+            targetSubtitleLabel.stringValue = "Target by process name"
+        } else {
+            let pidStr = pidField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            targetTitleLabel.stringValue = "Target PID: \(pidStr)"
+            targetSubtitleLabel.stringValue = "Target by PID"
+        }
+    }
     
     @objc private func handleBrowseProcesses() {
         onSwitchToProcesses?()
     }
     
-    @objc private func setPresetRoblox() {
-        processNameField.stringValue = "RobloxPlayer"
-        pidField.stringValue = ""
-        targetInfoLabel.stringValue = "✓ Target configured: RobloxPlayer"
-        targetInfoLabel.textColor = .systemPurple
-    }
-    
-    @objc private func setPresetFinder() {
-        processNameField.stringValue = "Finder"
-        pidField.stringValue = ""
-        targetInfoLabel.stringValue = "✓ Target configured: Finder"
-        targetInfoLabel.textColor = .systemPurple
-    }
-    
     @objc private func handleBrowseDylib() {
         let panel = NSOpenPanel()
-        panel.allowsMultipleSelection = false
-        panel.canChooseDirectories = false
         panel.canChooseFiles = true
-        panel.allowedContentTypes = [.init(filenameExtension: "dylib") ?? .data]
-        panel.title = "Select Payload .dylib"
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = []
         
         if panel.runModal() == .OK, let url = panel.url {
             dylibPathField.stringValue = url.path
-            validateDylibPath()
+            inspectDylib(atPath: url.path)
         }
     }
     
-    @objc private func handleUseBundledDylib() {
-        if let dylib = injectorService.resolveDefaultDylib() {
-            dylibPathField.stringValue = dylib
-            validateDylibPath()
-        } else {
-            dylibStatusLabel.stringValue = "✕ Bundled payload not found in standard directories."
-            dylibStatusLabel.textColor = .systemRed
+    @objc private func handleUseBundledPayload() {
+        if let defaultDylib = injectorService.resolveDefaultDylib() {
+            dylibPathField.stringValue = defaultDylib
+            inspectDylib(atPath: defaultDylib)
         }
     }
     
-    private func validateDylibPath() {
+    @objc private func handleDylibPathChanged() {
         let path = dylibPathField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        if FileManager.default.fileExists(atPath: path) {
-            dylibStatusLabel.stringValue = "✓ File verified: \(path)"
-            dylibStatusLabel.textColor = .systemGreen
-        } else {
-            dylibStatusLabel.stringValue = "✕ File does not exist at specified path."
-            dylibStatusLabel.textColor = .systemOrange
+        if !path.isEmpty {
+            inspectDylib(atPath: path)
         }
     }
     
     @objc private func handleTimeoutChanged() {
-        timeoutLabel.stringValue = "\(Int(timeoutSlider.doubleValue)) ms"
+        let ms = Int(timeoutSlider.doubleValue)
+        timeoutLabel.stringValue = "\(ms) ms"
     }
     
     @objc private func handleInject() {
         var config = InjectConfig()
-        config.targetNameText = processNameField.stringValue
-        config.targetPidText = pidField.stringValue
-        config.targetDylibPath = dylibPathField.stringValue
+        
+        let isPidMode = (targetModeSegmented.selectedSegment == 1)
+        if isPidMode {
+            config.targetPidText = pidField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            config.targetNameText = ""
+        } else {
+            config.targetNameText = processNameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            config.targetPidText = ""
+        }
+        
+        config.targetDylibPath = dylibPathField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         config.dlopenMode = (modePopup.indexOfSelectedItem == 0) ? .now : .lazy
         config.timeoutMs = timeoutSlider.doubleValue
         config.waitCompletion = (waitCompletionCheckbox.state == .on)
         config.verbose = (verboseCheckbox.state == .on)
         config.useAdminPrivileges = (adminCheckbox.state == .on)
         
-        injectButton.isEnabled = false
-        progressIndicator.startAnimation(nil)
-        resultBox.isHidden = true
-        
         Task {
             await injectorService.inject(config: config)
-            
-            await MainActor.run {
-                self.injectButton.isEnabled = true
-                self.progressIndicator.stopAnimation(nil)
-                self.resultBox.isHidden = false
-                
-                let isSuccess = self.injectorService.lastSuccess ?? false
-                let text = self.injectorService.lastResult ?? ""
-                
-                if isSuccess {
-                    self.resultBox.borderColor = .systemGreen
-                    self.resultBox.fillColor = NSColor.systemGreen.withAlphaComponent(0.12)
-                    self.resultLabel.textColor = .systemGreen
-                    self.resultLabel.stringValue = "✓ \(text)"
-                } else {
-                    self.resultBox.borderColor = .systemRed
-                    self.resultBox.fillColor = NSColor.systemRed.withAlphaComponent(0.12)
-                    self.resultLabel.textColor = .systemRed
-                    self.resultLabel.stringValue = "✕ \(text)"
-                }
-            }
         }
     }
 }

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 pub use rux_core::config::{
     DEFAULT_IPC_MAX_MESSAGE_SIZE, DEFAULT_IPC_PORT_START, IPC_MSG_EXECUTE, IPC_MSG_PING,
-    IPC_MSG_SETTING, IPC_PONG_BYTE, IPC_PORT_ATTEMPTS,
+    IPC_MSG_SETTING, IPC_MSG_TELEMETRY, IPC_PONG_BYTE, IPC_PORT_ATTEMPTS,
 };
 pub const DEFAULT_PORT_START: u16 = DEFAULT_IPC_PORT_START;
 pub const MAX_PORT_ATTEMPTS: u16 = IPC_PORT_ATTEMPTS;
@@ -19,8 +19,29 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: usize = DEFAULT_IPC_MAX_MESSAGE_SIZE;
 pub const IPC_EXECUTE: u8 = IPC_MSG_EXECUTE;
 pub const IPC_SETTING: u8 = IPC_MSG_SETTING;
 pub const IPC_PING: u8 = IPC_MSG_PING;
+pub const IPC_TELEMETRY: u8 = IPC_MSG_TELEMETRY;
 pub const PONG_BYTE: u8 = IPC_PONG_BYTE;
 
+static PAYLOAD_START: std::sync::LazyLock<std::time::Instant> = std::sync::LazyLock::new(std::time::Instant::now);
+
+fn get_resident_memory_bytes() -> u64 {
+    unsafe {
+        let mut basic_info: libc::mach_task_basic_info = std::mem::zeroed();
+        let mut count = (std::mem::size_of::<libc::mach_task_basic_info>() / std::mem::size_of::<libc::natural_t>()) as libc::mach_msg_type_number_t;
+        let task = rux_vm::MachTask::self_task();
+        let kr = libc::task_info(
+            task.port(),
+            libc::MACH_TASK_BASIC_INFO,
+            &mut basic_info as *mut _ as libc::task_info_t,
+            &mut count,
+        );
+        if kr == libc::KERN_SUCCESS {
+            basic_info.resident_size
+        } else {
+            1024 * 1024 * 32 // fallback 32MB
+        }
+    }
+}
 /// Dynamically determine the IPC bind host.
 pub fn get_ipc_host() -> String {
     use rux_core::config as cfg;
@@ -253,6 +274,29 @@ fn handle_client(
             continue;
         }
 
+        // Handle TELEMETRY
+        if header.msg_type == IPC_TELEMETRY {
+            let pid = unsafe { libc::getpid() };
+            let memory = get_resident_memory_bytes();
+            let uptime = PAYLOAD_START.elapsed().as_secs();
+            let lua_mgr = crate::luau::LuaStateManager::global();
+            let scripts_count = lua_mgr.scripts_executed_count();
+            let lua_status = lua_mgr.status_text();
+            let json_body = format!(
+                r#"{{"version":"0.2.0","target_pid":{},"uptime_seconds":{},"memory_rss_bytes":{},"whitelist_status":"Offline (Safe)","is_booster":true,"early_access":true,"crypto_status":"Active (Pure Rust AES/SHA/MD5)","active_hooks_count":0,"scripts_executed_total":{},"drawing_objects_count":0,"lua_state_status":"{}","hooks":[]}}"#,
+                pid, uptime, memory, scripts_count, lua_status
+            );
+            let json_bytes = json_body.as_bytes();
+            let mut resp_header = [0u8; rux_core::config::IPC_HEADER_WIRE_SIZE];
+            resp_header[0] = IPC_TELEMETRY;
+            let len_bytes = (json_bytes.len() as u64).to_le_bytes();
+            resp_header[8..16].copy_from_slice(&len_bytes);
+            let _ = stream.write_all(&resp_header);
+            let _ = stream.write_all(json_bytes);
+            let _ = stream.flush();
+            continue;
+        }
+
         // Validate payload length
         if header.size > max_message_size {
             eprintln!(
@@ -362,6 +406,28 @@ mod tests {
         let popped = server.pop_script();
         assert_eq!(popped.as_deref(), Some(script));
 
+        // Test Telemetry
+        let telem_header = IpcHeader {
+            msg_type: IPC_TELEMETRY,
+            size: 0,
+        };
+        let telem_header_bytes = unsafe {
+            std::slice::from_raw_parts(
+                &telem_header as *const _ as *const u8,
+                std::mem::size_of::<IpcHeader>(),
+            )
+        };
+        client.write_all(telem_header_bytes).unwrap();
+        let mut resp_hdr_buf = [0u8; rux_core::config::IPC_HEADER_WIRE_SIZE];
+        client.read_exact(&mut resp_hdr_buf).unwrap();
+        assert_eq!(resp_hdr_buf[0], IPC_TELEMETRY);
+        let resp_size = u64::from_le_bytes(resp_hdr_buf[8..16].try_into().unwrap()) as usize;
+        assert!(resp_size > 0);
+        let mut json_buf = vec![0u8; resp_size];
+        client.read_exact(&mut json_buf).unwrap();
+        let json_str = String::from_utf8(json_buf).unwrap();
+        assert!(json_str.contains("0.2.0"));
+        assert!(json_str.contains("uptime_seconds"));
         server.stop();
     }
 }

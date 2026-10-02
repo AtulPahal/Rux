@@ -17,8 +17,8 @@ public final class LogStore: ObservableObject {
     public func log(_ level: LogLevel, _ message: String) {
         let item = LogItem(level: level, message: message)
         items.append(item)
-        if items.count > maxEntries {
-            items.removeFirst(items.count - maxEntries)
+        if items.count > maxEntries + 100 {
+            items.removeFirst(100)
         }
     }
     
